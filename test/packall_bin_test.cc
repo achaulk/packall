@@ -51,23 +51,23 @@ void CanonicalBinaryTest(std::span<uint8_t> f_bytes, std::span<uint8_t> v_bytes,
 // These are canonical representations, these tests are immutable
 
 // s8/u8 is never var-encoded or zigzag encoded
-T(u8, uint8_t, B(f, 2, 0xFF), B(v, 2, 0xFF), 0xFF);
-T(s8, int8_t, B(f, 2, 0xFF), B(v, 2, 0xFF), -1);
-T(ch, char, B(f, 2, 0xFF), B(v, 2, 0xFF), -1);
+T(u8, uint8_t, B(f, 6, 0xFF), B(v, 6, 0xFF), 0xFF);
+T(s8, int8_t, B(f, 6, 0xFF), B(v, 6, 0xFF), -1);
+T(ch, char, B(f, 6, 0xFF), B(v, 6, 0xFF), -1);
 
-T(u16, uint16_t, B(f, 2, 0xFF, 0xFF), B(v, 2, 0xFF, 0xFF, 3), 0xFFFF);
-T(s16, int16_t, B(f, 2, 0x18, 0xFC), B(v, 2, 0xCF, 0x0F), -1000);
+T(u16, uint16_t, B(f, 6, 0xFF, 0xFF), B(v, 6, 0xFF, 0xFF, 3), 0xFFFF);
+T(s16, int16_t, B(f, 6, 0x18, 0xFC), B(v, 6, 0xCF, 0x0F), -1000);
 
-T(u32, uint32_t, B(f, 2, 0xFF, 0xFF, 0, 0), B(v, 2, 0xFF, 0xFF, 3), 0xFFFF);
-T(s32, int32_t, B(f, 2, 0x60, 0x79, 0xFE, 0xFF), B(v, 2, 0xBF, 0x9A, 0xC), -100000);
+T(u32, uint32_t, B(f, 6, 0xFF, 0xFF, 0, 0), B(v, 6, 0xFF, 0xFF, 3), 0xFFFF);
+T(s32, int32_t, B(f, 6, 0x60, 0x79, 0xFE, 0xFF), B(v, 6, 0xBF, 0x9A, 0xC), -100000);
 
-T(u64, uint64_t, B(f, 2, 0xFF, 0xFF, 0, 0, 0, 0, 0, 0), B(v, 2, 0xFF, 0xFF, 3), 0xFFFF);
-T(s64, int64_t, B(f, 2, 0x60, 0x79, 0xFE, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF), B(v, 2, 0xBF, 0x9A, 0xC), -100000);
+T(u64, uint64_t, B(f, 6, 0xFF, 0xFF, 0, 0, 0, 0, 0, 0), B(v, 6, 0xFF, 0xFF, 3), 0xFFFF);
+T(s64, int64_t, B(f, 6, 0x60, 0x79, 0xFE, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF), B(v, 6, 0xBF, 0x9A, 0xC), -100000);
 
 // Floating point representations don't have variable encodings
-T(f32, float, B(f, 2, 0xDB, 0x0F, 0x49, 0x40), B(v, 2, 0xDB, 0x0F, 0x49, 0x40), 3.14159265359f);
-T(f64, double, B(f, 2, 0xEA, 0x2E, 0x44, 0x54, 0xFB, 0x21, 0x09, 0x40),
-    B(v, 2, 0xEA, 0x2E, 0x44, 0x54, 0xFB, 0x21, 0x09, 0x40), 3.14159265359);
+T(f32, float, B(f, 6, 0xDB, 0x0F, 0x49, 0x40), B(v, 6, 0xDB, 0x0F, 0x49, 0x40), 3.14159265359f);
+T(f64, double, B(f, 6, 0xEA, 0x2E, 0x44, 0x54, 0xFB, 0x21, 0x09, 0x40),
+    B(v, 6, 0xEA, 0x2E, 0x44, 0x54, 0xFB, 0x21, 0x09, 0x40), 3.14159265359);
 
 // Simple nested struct
 struct two_ints
@@ -76,7 +76,8 @@ struct two_ints
 	bool operator==(const two_ints&) const = default;
 };
 
-T(twoints, two_ints, B(f, 2, 3, 0xFF, 0xFF, 0xFF, 0xFF, 0xE8, 3, 0, 0), B(v, 2, 3, 1, 0xD0, 0xF), two_ints{-1, 1000});
+T(twoints, two_ints, B(f, 6, 0xA, 0xFF, 0xFF, 0xFF, 0xFF, 0xE8, 3, 0, 0), B(v, 6, 0xA, 1, 0xD0, 0xF),
+    two_ints{-1, 1000});
 
 struct S
 {
@@ -116,41 +117,42 @@ TEST(packall_canonical, deprecated_and_optional_and_ptr)
 
 	// deprecated<T> replaces T's length with 0
 	pack(s, bytes);
-	EXPECT_EQ(bytes, (std::vector<uint8_t>{2, 0}));
+	EXPECT_EQ(bytes, (std::vector<uint8_t>{6, 0}));
 
 	// optional<T> for structs should encode the same way
 	bytes.clear();
 	pack(s2, bytes);
-	EXPECT_EQ(bytes, (std::vector<uint8_t>{2, 0}));
+	EXPECT_EQ(bytes, (std::vector<uint8_t>{6, 0}));
 
 	// unique_ptr<T> for structs should encode the same way
 	bytes.clear();
 	pack(s3, bytes);
-	EXPECT_EQ(bytes, (std::vector<uint8_t>{2, 0}));
+	EXPECT_EQ(bytes, (std::vector<uint8_t>{6, 0}));
 
 	// deprecated<T> replaces T's length with 0
 	bytes.clear();
 	pack(s4, bytes);
-	EXPECT_EQ(bytes, (std::vector<uint8_t>{2, 0}));
+	EXPECT_EQ(bytes, (std::vector<uint8_t>{6, 0}));
 
 	// optional<T> for containers should encode the same way
 	bytes.clear();
 	pack(s5, bytes);
-	EXPECT_EQ(bytes, (std::vector<uint8_t>{2, 0}));
+	EXPECT_EQ(bytes, (std::vector<uint8_t>{6, 0}));
 
 	// unique_ptr<T> for containers should encode the same way
 	bytes.clear();
 	pack(s6, bytes);
-	EXPECT_EQ(bytes, (std::vector<uint8_t>{2, 0}));
+	EXPECT_EQ(bytes, (std::vector<uint8_t>{6, 0}));
 
 	// Full structs/containers can still be "unpacked" into a deprecated<T>, also the same for optional and unique_ptr
-	std::vector<uint8_t> full{2, 3, 0xFF, 0xFF, 0xFF, 0xFF, 0xE8, 3, 0, 0};
-	EXPECT_EQ(unpack(s, full), status::ok);
-	EXPECT_EQ(unpack(s2, full), status::ok);
-	EXPECT_EQ(unpack(s3, full), status::ok);
-	EXPECT_EQ(unpack(s4, full), status::ok);
-	EXPECT_EQ(unpack(s5, full), status::ok);
-	EXPECT_EQ(unpack(s6, full), status::ok);
+	std::vector<uint8_t> full_con{2, 0xA, 0xFF, 0xFF, 0xFF, 0xFF, 0xE8, 3, 0, 0};
+	std::vector<uint8_t> full_obj{6, 0xA, 0xFF, 0xFF, 0xFF, 0xFF, 0xE8, 3, 0, 0};
+	EXPECT_EQ(unpack(s, full_obj), status::ok);
+	EXPECT_EQ(unpack(s2, full_obj), status::ok);
+	EXPECT_EQ(unpack(s3, full_obj), status::ok);
+	EXPECT_EQ(unpack(s4, full_con), status::ok);
+	EXPECT_EQ(unpack(s5, full_con), status::ok);
+	EXPECT_EQ(unpack(s6, full_con), status::ok);
 }
 
 // Omitted elements can be added anywhere
@@ -162,7 +164,7 @@ struct two_ints_omit
 };
 
 // Adding an omit<t> should not change the output
-T(twoints_omitthird, two_ints_omit, B(f, 2, 3, 0xFF, 0xFF, 0xFF, 0xFF, 0xE8, 3, 0, 0), B(v, 2, 3, 1, 0xD0, 0xF),
+T(twoints_omitthird, two_ints_omit, B(f, 6, 0xA, 0xFF, 0xFF, 0xFF, 0xFF, 0xE8, 3, 0, 0), B(v, 6, 0xA, 1, 0xD0, 0xF),
     two_ints_omit{std::string(), -1, 1000});
 
 // Immutable structs are stored inline!
@@ -175,7 +177,7 @@ struct two_ints_inline
 
 static_assert(detail::typeinfo<two_ints_inline>::use_predecode == false);
 
-T(twoints_imm, two_ints_inline, B(f, 2, 0xFF, 0xFF, 0xFF, 0xFF, 0xE8, 3, 0, 0), B(v, 2, 1, 0xD0, 0xF),
+T(twoints_imm, two_ints_inline, B(f, 6, 0xFF, 0xFF, 0xFF, 0xFF, 0xE8, 3, 0, 0), B(v, 6, 1, 0xD0, 0xF),
     two_ints_inline{-1, 1000});
 
 struct two_ints_inline_omit
@@ -186,7 +188,7 @@ struct two_ints_inline_omit
 	static constexpr traits Traits = traits::immutable;
 };
 
-T(twoints_imm_omit, two_ints_inline_omit, B(f, 2, 0xFF, 0xFF, 0xFF, 0xFF, 0xE8, 3, 0, 0), B(v, 2, 1, 0xD0, 0xF),
+T(twoints_imm_omit, two_ints_inline_omit, B(f, 6, 0xFF, 0xFF, 0xFF, 0xFF, 0xE8, 3, 0, 0), B(v, 6, 1, 0xD0, 0xF),
     two_ints_inline_omit{std::string(), -1, 1000});
 
 // Containers

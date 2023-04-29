@@ -179,7 +179,7 @@ but this should be unnecessary unless extending for custom containers or somethi
 All older buffers are always decodable correctly by newer code as long as entries are never removed or changed incompatibally. Additionally, older code can sometimes decode newer buffers.
 
 #### Structs
-A struct can provide trait flags to change how it is encoded. Note that changing this is itself a breaking change!
+A struct can provide trait flags to change how it is encoded. Note that immutable is forever!
 ```cpp
 struct MyStruct
 {
@@ -199,7 +199,7 @@ A struct that specifies the `immutable` flag forfeits any compatibility options 
 
 A struct that specifies the `backwards_compatible` flag uses a larger encoding that allows the decoder to skip newer unknown fields.
 
-By default (and with `backwards_compatible`) newer fields may be added to the end of any struct.
+By default (and with `backwards_compatible`) newer fields may be added to the end of any struct. `backwards_compatible` can be added retroactively the first time a struct definition is changed to preserve compatibility.
 
 In addition, in any struct
 * `packall::omit<T>` entries may be added, moved or removed anywhere.
@@ -289,7 +289,7 @@ struct MyStruct
 This uses the same scheme as protobufs, base-128 integers and zigzag encoding for signed values. Values are stored little-endian. One byte integers are directly stored always as a single byte.
 
 #### The prefix value
-For non-immutable structs this is the number of elements + 1 that will be omitted.
+For non-immutable structs this is the number of elements * 4 + 2 that will be omitted with an additional + 1 if this type is backwards compatible.
 For tuples this is the number of values stored + 1
 This value is always encoded as variable length
 

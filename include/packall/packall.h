@@ -19,61 +19,9 @@
 
 #include <string.h>
 
+#include "packall_forward.h"
+
 namespace packall {
-
-// Avoid unbounded memory consumption on decode. A million seems like a good default cap.
-#ifdef PACKALL_MAX_ELEMENTS
-static constexpr size_t kMaximumVectorSize = PACKALL_MAX_ELEMENTS;
-#else
-static constexpr size_t kMaximumVectorSize = 1000000;
-#endif
-
-enum class options : uint8_t
-{
-	none = 0,
-	variable_length_encoding = 1,
-};
-constexpr options operator|(options l, options r)
-{
-	return static_cast<options>(static_cast<uint8_t>(l) | static_cast<uint8_t>(r));
-}
-constexpr bool operator&(options l, options r)
-{
-	return !!(static_cast<uint8_t>(l) & static_cast<uint8_t>(r));
-}
-
-enum class status
-{
-	ok,
-	// Buffer is either incorrect or is a newer version and without decode assists.
-	incompatible,
-	// Buffer is too small! EOF in the middle of decoding a type other than at a struct member boundary.
-	data_underrun,
-	// Available to user implementations, not currently thrown.
-	bad_data,
-	// Data structure exceeds maximum allowable depth.
-	stack_overflow,
-	// Bad formatted data for parser.
-	bad_format,
-	bad_variant_value,
-	unknown_key,
-	out_of_memory,
-};
-
-enum class traits : uint8_t
-{
-	none,
-	backwards_compatible = 1,
-	immutable = 2,
-};
-constexpr traits operator|(traits l, traits r)
-{
-	return static_cast<traits>(static_cast<uint8_t>(l) | static_cast<uint8_t>(r));
-}
-constexpr bool operator&(traits l, traits r)
-{
-	return !!(static_cast<uint8_t>(l) & static_cast<uint8_t>(r));
-}
 
 namespace detail {
 template<typename T>
@@ -698,7 +646,7 @@ concept is_listlike = is_container<T> && requires(T t, size_t sz) {
 
 template<typename T>
 concept is_aggregate_struct = std::is_aggregate_v<T> && !
-is_array_type<T>::value && !is_custom_serialized<T>;
+is_array_type<T>::value && !is_custom_serialized<T> && std::is_class_v<T>;
 
 template<typename T>
 struct emit_element
@@ -742,11 +690,12 @@ struct typeinfo<T>
 	static constexpr size_t Arity = aggregate_arity_calc<T>::Arity;
 	static_assert(Arity < 250);
 
-	static constexpr uint8_t predecode_info =
-	    (Arity > 0 ? calculate_predecode<T, Arity>(std::make_index_sequence<Arity>()) : 0) + 1;
+	static constexpr bool is_backwards_compatible = struct_traits<T>::Traits & traits::backwards_compatible;
+	static constexpr size_t predecode_info =
+	    (Arity > 0 ? calculate_predecode<T, Arity>(std::make_index_sequence<Arity>()) : 0) * 4 + 2 +
+		(is_backwards_compatible ? 1 : 0);
 	static constexpr bool use_predecode = !(struct_traits<T>::Traits & traits::immutable);
 
-	static constexpr bool is_backwards_compatible = struct_traits<T>::Traits & traits::backwards_compatible;
 
 	template<typename Container>
 	static void pack(T& obj, Container& out)
@@ -782,7 +731,7 @@ struct typeinfo<T>
 	template<typename Container>
 	static void unpack(T& obj, Container& in)
 	{
-		size_t n = Arity + 1;
+		size_t n = predecode_info;
 		if constexpr(use_predecode)
 			n = in.read_sz();
 		unpack_helper(obj, n, in, std::make_index_sequence<Arity>());
@@ -800,16 +749,17 @@ struct typeinfo<T>
 		// If no elements were written, this is either an empty struct, or a deprecated<T>, in any case no size was written
 		if(n == 0)
 			return;
-		n--;
+		bool bc = n & 1;
+		n >>= 2;
 
 		size_t at = 0;
-		if constexpr(is_backwards_compatible) {
+		if(bc) {
 			at = in.enter();
 		} else if(n > Arity) [[unlikely]] {
 			throw status::incompatible;
 		}
 		(maybe_unpack<Index>(obj, n, in) && ...);
-		if constexpr(is_backwards_compatible)
+		if(bc)
 			in.leave(at);
 		maybe_postdecode(obj);
 	}
@@ -861,7 +811,7 @@ struct typeinfo<T>
 	}
 };
 
-// T[N] & array<T, N>
+// array<T, N>
 template<typename T>
     requires(std::is_aggregate_v<T> && is_array_type<T>::value)
 struct typeinfo<T>
@@ -869,29 +819,6 @@ struct typeinfo<T>
 	using type = typename is_array_type<T>::type;
 	static constexpr size_t N = is_array_type<T>::kN;
 	static constexpr uint8_t type_id = static_cast<uint8_t>(type_id::array);
-
-	template<typename Container>
-	static void pack(T *obj, Container& out)
-	{
-		out.write_sz(N + 1);
-		for(size_t i = 0; i < N; i++) {
-			typeinfo<type>::pack(obj[i], out);
-		}
-	}
-
-	template<typename Container>
-	static void unpack(T *obj, Container& in)
-	{
-		uint32_t n = in.read_sz();
-		if(n == 0)
-			return;
-		n--;
-		if(n > N)
-			throw status::incompatible;
-		for(size_t i = 0; i < n; i++) {
-			typeinfo<type>::unpack(obj[i], in);
-		}
-	}
 
 	template<typename Container>
 	static void pack(std::array<type, N>& obj, Container& out)
@@ -904,6 +831,60 @@ struct typeinfo<T>
 
 	template<typename Container>
 	static void unpack(std::array<type, N>& obj, Container& in)
+	{
+		size_t n = in.read_sz();
+		if(n == 0)
+			return;
+		n--;
+		if(n > N)
+			throw status::incompatible;
+		for(size_t i = 0; i < n; i++) {
+			typeinfo<type>::unpack(obj[i], in);
+		}
+	}
+
+	static constexpr void get_types(type_list& t)
+	{
+		t.types.push_back(type_id);
+		size_t v = N;
+		while(v > 0) {
+			t.types.push_back((uint8_t)v);
+			v >>= 8;
+		}
+		typeinfo<type>::get_types(t);
+	}
+
+	template<typename Foreach>
+	static void for_each(const char *name, T *obj, Foreach& c)
+	{
+		c.visit(0, name, obj);
+	}
+	template<typename Foreach>
+	static void for_each(const char *name, std::array<type, N>& obj, Foreach& c)
+	{
+		c.visit(0, name, obj);
+	}
+};
+
+template<typename T>
+    requires(std::is_aggregate_v<T> && std::is_array_v<T>)
+struct typeinfo<T>
+{
+	using type = std::remove_cvref_t<decltype(std::declval<T>()[0])>;
+	static constexpr size_t N = std::extent_v<T>;
+	static constexpr uint8_t type_id = static_cast<uint8_t>(type_id::array);
+
+	template<typename Container>
+	static void pack(T& obj, Container& out)
+	{
+		out.write_sz(N + 1);
+		for(size_t i = 0; i < N; i++) {
+			typeinfo<type>::pack(obj[i], out);
+		}
+	}
+
+	template<typename Container>
+	static void unpack(T& obj, Container& in)
 	{
 		size_t n = in.read_sz();
 		if(n == 0)
@@ -1648,14 +1629,17 @@ struct typeinfo<std::variant<V...>>
 	template<typename Container, size_t... Index>
 	static void pack_helper(type& obj, Container& out, std::index_sequence<Index...>)
 	{
-		(maybe_pack<Index>(obj, out), ...);
+		(maybe_pack<Index>(obj, out) || ...);
 	}
 
 	template<size_t I, typename Container>
-	static void maybe_pack(type& obj, Container& out)
+	static bool maybe_pack(type& obj, Container& out)
 	{
-		if(I == obj.index())
+		if(I == obj.index()) {
 			typeinfo<std::variant_alternative_t<I, type>>::pack(std::get<I>(obj), out);
+			return true;
+		}
+		return false;
 	}
 
 	template<typename Container>
@@ -1681,7 +1665,7 @@ struct typeinfo<std::variant<V...>>
 		if(I == n) {
 			std::variant_alternative_t<I, type> v;
 			typeinfo<std::variant_alternative_t<I, type>>::unpack(v, in);
-			obj = v;
+			obj = std::move(v);
 			return true;
 		}
 		return false;

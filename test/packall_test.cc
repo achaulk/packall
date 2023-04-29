@@ -122,6 +122,19 @@ struct packall::container_wrapper<custom_buffer>
 		return true;
 	}
 
+	size_t enter()
+	{
+		uint32_t v;
+		size_t at = rd;
+		read_bytes(&v, 4);
+		rd += 4;
+		return at + v;
+	}
+	void leave(size_t at)
+	{
+		rd = at;
+	}
+
 	custom_buffer& o;
 	size_t rd = 0;
 };

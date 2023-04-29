@@ -30,6 +30,24 @@ void unparse(const T& obj, std::string& text);
 
 namespace detail {
 template<typename T>
+concept is_custom_text_serialized = requires(T t) {
+	                                    t.parse;
+	                                    t.format;
+                                    };
+
+template<typename T>
+constexpr bool is_default_value(const T&)
+{
+	return false;
+}
+
+template<std::equality_comparable T>
+constexpr bool is_default_value(const T& o)
+{
+	return o == T{};
+}
+
+template<typename T>
 struct parser;
 
 struct parse_state
@@ -39,13 +57,42 @@ struct parse_state
 	std::string_view token;
 	uint32_t depth = 0;
 
+	bool maybe_nil()
+	{
+		if(e - s >= 3 && s[0] == 'n' && s[1] == 'i' && s[2] == 'l') {
+			s += 3;
+			return true;
+		}
+		return false;
+	}
+
 	void next()
 	{
-		while(s < e && (*s == ' ' || *s == '\t' || *s == '\r' || *s == '\n')) s++;
+		skip_ws();
 	}
 	void skip_ws()
 	{
 		while(s < e && (*s == ' ' || *s == '\t' || *s == '\r' || *s == '\n')) s++;
+		if(s + 1 < e && s[0] == '-' && s[1] == '-') {
+			// comment!
+			s += 2;
+			skip_comment();
+			skip_ws();
+		}
+	}
+	void skip_comment()
+	{
+		if(s + 2 < e && *s == '[') {
+			int n = 0;
+			auto p = s;
+			while(p < e && *p == '=') n++, p++;
+			if(e != p && *p == '[') {
+				s = p + 1;
+				parse_long_string_impl(n);
+				return;
+			}
+		}
+		while(s < e && *s != '\n') s++;
 	}
 	void expect(char ch)
 	{
@@ -126,6 +173,11 @@ struct parse_state
 		if(e - s < 2 || *s != '[')
 			throw status::bad_format;
 		s++;
+		return parse_long_string_impl(n);
+	}
+
+	std::string_view parse_long_string_impl(int n)
+	{
 		const char *start = s;
 		while(s < e && !check_long_string_end(s, n)) s++;
 
@@ -591,6 +643,7 @@ struct parser<std::tuple<V...>>
 struct writer_state
 {
 	std::string o;
+	bool omit_default = false;
 
 	void newscope()
 	{
@@ -710,13 +763,17 @@ template<is_aggregate_struct T>
 struct writer<T>
 {
 	writer_state& s;
+	uint32_t n = 0;
 
 	static void write(const T& obj, writer_state& s)
 	{
+		size_t at = s.o.size();
 		s.newscope();
 		writer<T> wr{s};
 		foreach_member(const_cast<T&>(obj), wr);
 		s.endscope();
+		if(wr.n == 0 && s.omit_default)
+			s.o.resize(at);
 	}
 
 	constexpr void enter(std::string_view name) {}
@@ -725,6 +782,9 @@ struct writer<T>
 	template<typename U>
 	void visit(uint32_t index, const char *name, U& obj)
 	{
+		if(s.omit_default && is_default_value(obj))
+			return;
+		n++;
 		// Generally a C++ name can also be a valid Lua name with the only difference being keywords
 		// and break do else false for goto if not or return true while are C++ keywords too
 		// elseif end function in local nil repeat then until are not
@@ -869,24 +929,134 @@ struct writer<std::tuple<V...>>
 {
 	using type = std::tuple<V...>;
 
-	static void write(const type& obj, writer_state& s)
+	static bool write(const type& obj, writer_state& s)
 	{
+		size_t at = s.o.size();
 		s.newscope();
-		write_helper(obj, s, std::make_index_sequence<sizeof...(V)>());
-		s.endscope();
+		if(write_helper(obj, s, std::make_index_sequence<sizeof...(V)>()) || !s.omit_default) {
+			s.endscope();
+			return true;
+		}
+		s.o.resize(at);
+		return false;
 	}
 
 	template<size_t... Index>
-	static void write_helper(const type& obj, writer_state& s, std::index_sequence<Index...>)
+	static size_t write_helper(const type& obj, writer_state& s, std::index_sequence<Index...>)
 	{
-		(write_one<Index>(obj, s), ...);
+		return (write_one<Index>(obj, s) + ...);
 	}
 
 	template<size_t I>
-	static void write_one(const type& obj, writer_state& s)
+	static size_t write_one(const type& obj, writer_state& s)
 	{
+		if(s.omit_default && is_default_value(std::get<I>(obj)))
+			return 0;
 		writer<std::tuple_element_t<I, type>>::write(std::get<I>(obj), s);
 		s.next();
+		return 1;
+	}
+};
+
+template<is_custom_text_serialized T>
+struct writer<T>
+{
+	using type = T;
+	static void write(type& obj, writer_state& s)
+	{
+		obj.format(s);
+	}
+};
+
+template<is_custom_text_serialized T>
+struct writer<T *>
+{
+	using type = T;
+	static void write(type *obj, writer_state& s)
+	{
+		if(obj)
+			obj->format(s);
+		else
+			s.o.append("nil");
+	}
+};
+
+template<is_custom_text_serialized T>
+struct parser<T>
+{
+	using type = T;
+	static void parse(type& obj, parse_state& s)
+	{
+		obj.parse(s);
+	}
+};
+
+template<is_custom_text_serialized T>
+struct parser<T *>
+{
+	using type = T;
+	static void parse(type *obj, parse_state& s)
+	{
+		if(s.maybe_nil())
+			return;
+		if(obj)
+			obj->parse(s);
+		else
+			throw status::bad_data;
+	}
+};
+
+template<typename T>
+struct parser<std::unique_ptr<T>>
+{
+	using type = T;
+	static void parse(type& obj, parse_state& s)
+	{
+		if(s.maybe_nil())
+			return;
+		obj = std::make_unique<T>();
+		parser<T>::parser(*obj, s);
+	}
+};
+
+template<typename T>
+struct writer<std::unique_ptr<T>>
+{
+	using type = T;
+	static void parse(type& obj, writer_state& s)
+	{
+		if(!obj) {
+			s.o.append("nil");
+			return;
+		}
+		writer<T>::write(*obj, s);
+	}
+};
+
+template<typename T>
+struct parser<std::optional<T>>
+{
+	using type = T;
+	static void parse(type& obj, parse_state& s)
+	{
+		if(s.maybe_nil())
+			return;
+		obj.emplace();
+		parser<T>::parser(*obj, s);
+	}
+};
+
+template<typename T>
+struct writer<std::optional<T>>
+{
+	using type = T;
+	static void parse(type& obj, writer_state& s)
+	{
+		if(!obj) {
+			s.o.append("nil");
+			return;
+		}
+		writer<T>::write(*obj, s);
 	}
 };
 
@@ -896,7 +1066,7 @@ struct prettyprint_state
 	int scope = 0;
 };
 
-const char *pp_shortstr(std::string& s, const char *p, const char *e)
+inline const char *pp_shortstr(std::string& s, const char *p, const char *e)
 {
 	char ch = *p++;
 	s.push_back(ch);
@@ -910,7 +1080,7 @@ const char *pp_shortstr(std::string& s, const char *p, const char *e)
 	return p + 1;
 }
 
-const char *pp_longstr(std::string& s, const char *p, const char *e, uint32_t& info)
+inline const char *pp_longstr(std::string& s, const char *p, const char *e, uint32_t& info)
 {
 	const char *start = p;
 
@@ -957,7 +1127,7 @@ const char *pp_longstr(std::string& s, const char *p, const char *e, uint32_t& i
 	return p;
 }
 
-const char *prettyprint(std::string& s, const char *p, const char *e, int scope = 0)
+inline const char *prettyprint(std::string& s, const char *p, const char *e, int scope = 0)
 {
 	int original_scope = scope;
 	int state = 1; // 0 = after newline, 1 = after data, 2 = after assign,
@@ -1053,7 +1223,7 @@ inline void format(const T& obj, std::string& text)
 	text.swap(s.o);
 }
 
-std::string prettyprint(std::string_view in)
+inline std::string prettyprint(std::string_view in)
 {
 	std::string s;
 	s.reserve((in.size() * 3) / 2);
