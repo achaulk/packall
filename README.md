@@ -121,15 +121,23 @@ To support arbitrary encoding, an object can implement the following
 ```cpp
 class ComplexGraph
 {
-	template<typename Container>
-	void pack(Container& c);
-	template<typename Container>
-	void unpack(Container& c);
+	void pack(packall::bytebuffer& buf)
+	{
+		packall::serializer_t<packall::options::none> c(buf);
+		c.write(x);
+	}
+	void unpack(packall::bytebuffer& buf)
+	{
+		packall::serializer_t<packall::options::none> c(buf);
+		c.read(x);
+	}
+
+	int x;
 };
 ```
-Container is a class that provides the following interface
+packall::serializer_t is a class that provides the following interface
 ```cpp
-struct Container
+struct
 {
 	// Encode interface
 	void write(PrimitiveType);
@@ -239,30 +247,22 @@ Additionally other containers that look similar to a vector (having push_back, d
 To implement a custom container, you can provide a specialization as follows
 ```cpp
 template<>
-struct packall::container_wrapper<MyContainer>
+struct packall::bytebuffer_impl<MyContainer>
 {
-	// Write interface
-	void write_u8(uint8_t v);
-	void write_bytes(const void *v, size_t sz);
-	size_t push();
-	void pop(size_t at);
-
-	// Read interface
-	uint8_t read_u8();
-	uint8_t peek_u8();
-	void read_bytes(void *v, size_t sz);
-	size_t enter();
-	void leave(size_t at);
-	bool end();
-	bool ok();
+	// Read at least n bytes. If n is zero it is not an error to be at the end of the buffer.
+	void more_data(size_t n) override;
+	// Provide at least n bytes of free space in the buffer (e - p).
+	void more_buffer(size_t n) override;
+	// Move p to be at the specified byte offset
+	void seek_to(size_t at) override;
+	// Fixup the 4 bytes at offset at, write n into it
+	void fix_offset(size_t at, uint32_t n) override;
+	// Write any pending data
+	void flush_all() override;
 };
 ```
 
-`peek_u8` should return the byte that would be read next, but must not treat an error or out of bounds access as a failure condition.
-`end` must return true if an EOF boundary would be hit (it must return true after reading the last byte).
-`ok` can be used to indicate any boundary decode issues.
-
-This may throw a `packall::status` value on decode to error out.
+This may throw a `packall::status` value in more_data() or seek_to() to error out.
 
 ### Safety
 Serialization is type-safe and fuzz-tested. Invalid input sequences should never crash, but may leave objects partially-initialized or with unexpected values (eg floating point NaNs or bad enum values).

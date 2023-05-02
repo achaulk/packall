@@ -42,6 +42,8 @@ enum class status
 	bad_variant_value,
 	unknown_key,
 	out_of_memory,
+	write_disallowed,
+	read_disallowed,
 };
 
 enum class traits : uint8_t

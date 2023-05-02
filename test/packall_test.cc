@@ -52,14 +52,14 @@ TEST(packall, explicit_arity)
 
 struct custom_struct
 {
-	template<typename C>
-	void pack(C& c)
+	void pack(packall::bytebuffer& buf)
 	{
+		packall::serializer_t<packall::options::none> c(buf);
 		c.write(v);
 	}
-	template<typename C>
-	void unpack(C& c)
+	void unpack(packall::bytebuffer& buf)
 	{
+		packall::serializer_t<packall::options::none> c(buf);
 		c.read(v);
 	}
 
@@ -82,61 +82,49 @@ struct custom_buffer
 	std::vector<uint8_t> buf;
 };
 template<>
-struct packall::container_wrapper<custom_buffer>
+struct packall::bytebuffer_impl<custom_buffer> : public packall::bytebuffer
 {
-	container_wrapper(custom_buffer& o) : o(o) {}
-
-	void write_u8(uint8_t v)
+	bytebuffer_impl(custom_buffer& o, bool write) : o(o)
 	{
-		o.buf.push_back(v);
-	}
-	void write_bytes(const void *v, size_t sz)
-	{
-		auto ptr = static_cast<const uint8_t *>(v);
-		for(size_t i = 0; i < sz; i++) o.buf.push_back(ptr[i]);
+		if(write)
+			o.buf.resize(256);
+		s = p = o.buf.data();
+		e = s + o.buf.size();
 	}
 
-	uint8_t read_u8()
+	~bytebuffer_impl()
 	{
-		if(rd == o.buf.size())
+		if(write)
+			o.buf.resize(p - s);
+	}
+
+	void more_data(size_t n) override
+	{
+		if(n > 0)
 			throw status::data_underrun;
-		return o.buf[rd++];
 	}
-
-	void read_bytes(void *v, size_t sz)
+	void more_buffer(size_t n) override
 	{
-		if(rd + sz > o.buf.size())
+		o.buf.resize(o.buf.size() + n + 256);
+		ptrdiff_t delta = o.buf.data() - s;
+		s += delta;
+		p += delta;
+		e += delta;
+	}
+	void seek_to(size_t at) override
+	{
+		if(at >= o.buf.size())
 			throw status::data_underrun;
-		auto ptr = static_cast<uint8_t *>(v);
-		memcpy(v, &o.buf[rd], sz);
-		rd += sz;
+		p = s + at;
 	}
-
-	bool end() const
+	void fix_offset(size_t at, uint32_t n) override
 	{
-		return rd == o.buf.size();
+		memcpy(o.buf.data() + at, &n, 4);
 	}
-
-	bool ok() const
-	{
-		return true;
-	}
-
-	size_t enter()
-	{
-		uint32_t v;
-		size_t at = rd;
-		read_bytes(&v, 4);
-		rd += 4;
-		return at + v;
-	}
-	void leave(size_t at)
-	{
-		rd = at;
-	}
+	void flush_all() override {}
 
 	custom_buffer& o;
-	size_t rd = 0;
+	bool write;
 };
 TEST(packall, custom_buffer)
 {

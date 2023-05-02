@@ -110,7 +110,96 @@ template<typename T, typename Foreach>
 void foreach_member(T& obj, Foreach& c);
 
 template<typename T>
-struct container_wrapper;
+struct bytebuffer_impl;
+
+struct bytebuffer
+{
+	virtual ~bytebuffer() = default;
+	virtual void more_data(size_t n) = 0;
+	virtual void more_buffer(size_t n) = 0;
+	virtual void seek_to(size_t at) = 0;
+	virtual void fix_offset(size_t at, uint32_t n) = 0;
+	virtual void flush_all() = 0;
+
+	void write_u8(uint8_t v)
+	{
+		if(p == e) [[unlikely]] {
+			more_buffer(0);
+		}
+		*p++ = v;
+	}
+	void write_bytes(const void *v, size_t sz)
+	{
+		if(e - p < (ptrdiff_t)sz) [[unlikely]] {
+			more_buffer(sz);
+		}
+		memcpy(p, v, sz);
+		p += sz;
+	}
+
+	size_t push()
+	{
+		size_t ret = offset + (p - s);
+		uint32_t v = 0;
+		write_bytes(&v, 4);
+		return ret;
+	}
+	void pop(size_t at)
+	{
+		uint32_t sz = (uint32_t)(offset + (p - s) - at);
+		fix_offset(at, sz);
+	}
+
+	size_t enter()
+	{
+		uint32_t v;
+		size_t ret = offset + (p - s);
+		read_bytes(&v, 4);
+		return ret + v;
+	}
+	void leave(size_t at)
+	{
+		seek_to(at);
+	}
+
+	uint8_t read_u8()
+	{
+		if(p == e) [[unlikely]]
+			more_data(1);
+		uint8_t v = *p++;
+		if(p == e) [[unlikely]]
+			more_data(0);
+		return v;
+	}
+	uint8_t peek_u8()
+	{
+		return *p;
+	}
+
+	void read_bytes(void *v, size_t sz)
+	{
+		if(e - p < (ptrdiff_t)sz) [[unlikely]] {
+			more_data(sz - (e - p));
+		}
+		memcpy(v, p, sz);
+		p += sz;
+		if(p == e) [[unlikely]]
+			more_data(0);
+	}
+
+	bool end() const
+	{
+		return p == e;
+	}
+
+	bool ok()
+	{
+		return true;
+	}
+
+	size_t offset = 0;
+	uint8_t *s = nullptr, *p = nullptr, *e = nullptr;
+};
 
 // Everything below this is implementation details
 namespace detail {
@@ -200,10 +289,10 @@ constexpr T zigzag_decode(T v)
 	return (v >> 1) ^ (~(v & 1) + 1);
 }
 
-template<bool VariableEncoding, typename T>
+template<bool VariableEncoding>
 struct bytes_converter
 {
-	bytes_converter(T& wrap) : wrap(wrap) {}
+	bytes_converter(bytebuffer& wrap) : wrap(wrap) {}
 
 	void write(int8_t v)
 	{
@@ -455,7 +544,13 @@ struct bytes_converter
 		wrap.leave(at);
 	}
 
-	T& wrap;
+	bytebuffer& get_custom_buffer()
+	{
+		return wrap;
+	}
+
+	bytebuffer& wrap;
+
 };
 
 template<typename T>
@@ -585,12 +680,12 @@ struct typeinfo<T>
 	template<typename Container>
 	static void pack(T& obj, Container& out)
 	{
-		obj.pack(out);
+		obj.pack(out.get_custom_buffer());
 	}
 	template<typename Container>
 	static void unpack(T& obj, Container& in)
 	{
-		obj.unpack(in);
+		obj.unpack(in.get_custom_buffer());
 	}
 	static constexpr void get_types(type_list& t)
 	{
@@ -1792,8 +1887,8 @@ constexpr std::string_view get_type_name()
 template<options o, typename T, typename Container>
 inline void pack(const T& obj, Container& out)
 {
-	container_wrapper<Container> wrap(out);
-	detail::bytes_converter<o & options::variable_length_encoding, container_wrapper<Container>> bc(wrap);
+	bytebuffer_impl<Container> wrap(out, true);
+	detail::bytes_converter<o & options::variable_length_encoding> bc(wrap);
 	detail::typeinfo<T>::pack(const_cast<T&>(obj), bc);
 }
 
@@ -1801,8 +1896,8 @@ template<options o, typename T, typename Container>
 [[nodiscard]] inline status unpack(T& obj, Container& in)
 {
 	try {
-		container_wrapper<Container> wrap(in);
-		detail::bytes_converter<o & options::variable_length_encoding, container_wrapper<Container>> bc(wrap);
+		bytebuffer_impl<Container> wrap(in, false);
+		detail::bytes_converter<o & options::variable_length_encoding> bc(wrap);
 		detail::typeinfo<T>::unpack(obj, bc);
 		return wrap.ok() ? status::ok : status::data_underrun;
 	} catch(status s) {
@@ -1825,227 +1920,153 @@ concept is_vectorlike_container = requires(T t, uint8_t v) {
 	                                  t.size();
                                   };
 
+
+
 template<is_vectorlike_container T>
-struct container_wrapper<T>
+struct bytebuffer_impl<T> : public bytebuffer
 {
-	container_wrapper(T& o) : o(o)
+	bytebuffer_impl(T& o, bool write) : o(o), write(write)
 	{
 		// If you're not writing bytes then what?
 		static_assert(sizeof(*o.data()) == sizeof(uint8_t));
+
+		if(write)
+			o.resize(256);
+		s = p = o.data();
+		e = s + o.size();
 	}
 
-	void write_u8(uint8_t v)
+	~bytebuffer_impl()
 	{
-		o.push_back(v);
-	}
-	void write_bytes(const void *v, size_t sz)
-	{
-		auto ptr = static_cast<const uint8_t *>(v);
-		for(size_t i = 0; i < sz; i++) o.push_back(ptr[i]);
+		if(write)
+			o.resize(p - s);
 	}
 
-	size_t push()
+	void more_data(size_t n) override
 	{
-		size_t ret = o.size();
-		o.push_back(0);
-		o.push_back(0);
-		o.push_back(0);
-		o.push_back(0);
-		return ret;
-	}
-	void pop(size_t at)
-	{
-		uint32_t sz = (uint32_t)(o.size() - at);
-		memcpy(o.data() + at, &sz, 4);
-	}
-
-	size_t enter()
-	{
-		uint32_t v;
-		memcpy(&v, o.data() + rd, 4);
-		size_t ret = v + rd;
-		rd += 4;
-		if(ret > o.size())
+		if(n > 0)
 			throw status::data_underrun;
-		return ret;
 	}
-	void leave(size_t at)
+	void more_buffer(size_t n) override
 	{
-		if(rd > o.size())
+		o.resize(o.size() + n + 256);
+		ptrdiff_t delta = o.data() - s;
+		s += delta;
+		p += delta;
+		e += delta;
+	}
+	void seek_to(size_t at) override
+	{
+		if(at >= o.size())
 			throw status::data_underrun;
-		rd = at;
+		p = s + at;
 	}
-
-	uint8_t read_u8()
+	void fix_offset(size_t at, uint32_t n) override
 	{
-		if(rd == o.size())
-			throw status::data_underrun;
-		return o.data()[rd++];
+		memcpy(o.data() + at, &n, 4);
 	}
-	uint8_t peek_u8()
-	{
-		if(rd == o.size())
-			return 0;
-		return o.data()[rd];
-	}
-
-	void read_bytes(void *v, size_t sz)
-	{
-		if(rd + sz > o.size())
-			throw status::data_underrun;
-		auto ptr = static_cast<uint8_t *>(v);
-		memcpy(v, o.data() + rd, sz);
-		rd += sz;
-	}
-
-	bool end() const
-	{
-		return rd == o.size();
-	}
-
-	bool ok()
-	{
-		return true;
-	}
+	void flush_all() override {}
 
 	T& o;
-	size_t rd = 0;
+	bool write;
 };
 
 template<>
-struct container_wrapper<std::span<uint8_t>>
+struct bytebuffer_impl<std::span<uint8_t>> : public bytebuffer
 {
-	container_wrapper(std::span<uint8_t> o) : o(o) {}
-
-	uint8_t read_u8()
+	bytebuffer_impl(std::span<uint8_t> o, bool write) : o(o)
 	{
-		if(rd == o.size())
+		if(write)
+			throw status::write_disallowed;
+		s = p = o.data();
+		e = s + o.size();
+	}
+
+	~bytebuffer_impl()
+	{
+	}
+
+	void more_data(size_t n) override
+	{
+		if(n > 0)
 			throw status::data_underrun;
-		return o[rd++];
 	}
-	uint8_t peek_u8()
+	void more_buffer(size_t n) override
 	{
-		if(rd == o.size())
-			return 0;
-		return o[rd];
 	}
-
-	void read_bytes(void *v, size_t sz)
+	void seek_to(size_t at) override
 	{
-		if(rd + sz > o.size())
+		if(at >= o.size())
 			throw status::data_underrun;
-		auto ptr = static_cast<uint8_t *>(v);
-		memcpy(v, &o[rd], sz);
-		rd += sz;
+		p = s + at;
 	}
-
-	size_t enter()
+	void fix_offset(size_t at, uint32_t n) override
 	{
-		uint32_t v;
-		memcpy(&v, o.data() + rd, 4);
-		size_t ret = v + rd;
-		rd += 4;
-		if(ret > o.size())
-			throw status::data_underrun;
-		return ret;
 	}
-	void leave(size_t at)
-	{
-		rd = at;
-	}
-
-	bool end() const
-	{
-		return rd == o.size();
-	}
-
-	bool ok()
-	{
-		return true;
-	}
+	void flush_all() override {}
 
 	std::span<uint8_t> o;
-	size_t rd = 0;
 };
 
 template<typename C, typename T>
-struct container_wrapper<std::basic_ostream<C, T>>
+struct bytebuffer_impl<std::basic_ostream<C, T>> : public bytebuffer
 {
-	container_wrapper(std::basic_ostream<C, T>& o) : o(o) {}
-
-	void write_u8(uint8_t v)
+	bytebuffer_impl(std::basic_ostream<C, T>& o, bool write) : o(o)
 	{
-		o.put(v);
+		if(!write)
+			throw status::read_disallowed;
+
+		vec.resize(1024);
+		s = p = vec.data();
+		e = s + vec.size();
 	}
 
-	void write_bytes(const void *v, size_t sz)
+	~bytebuffer_impl()
 	{
-		o.write(static_cast<const C *>(v), sz);
+		o.write(s, p - s);
 	}
+
+	void more_data(size_t n) override
+	{
+	}
+	void more_buffer(size_t n) override
+	{
+		o.write(s, p - s);
+		p = s;
+		if(n > vec.size()) {
+			vec.resize(n);
+			p = s = vec.data();
+			e = p + n;
+		}
+	}
+	void seek_to(size_t at) override
+	{
+	}
+	void fix_offset(size_t at, uint32_t n) override
+	{
+		memcpy(o.data() + at, &n, 4);
+	}
+	void flush_all() override {}
 
 	std::basic_ostream<C, T>& o;
+	std::vector<uint8_t> vec;
 };
 
 template<typename C, typename T>
-struct container_wrapper<std::basic_istream<C, T>>
+struct bytebuffer_impl<std::basic_istream<C, T>>
 {
-	container_wrapper(std::basic_istream<C, T>& o) : o(o)
+	bytebuffer_impl(std::basic_istream<C, T>& o) : o(o)
 	{
-		o.get(peek);
 	}
-	~container_wrapper()
+	~bytebuffer_impl()
 	{
-		o.unget();
-	}
-
-	uint8_t read_u8()
-	{
-		uint8_t v = peek;
-		o.get(peek);
-		return v;
-	}
-	uint8_t peek_u8()
-	{
-		return peek;
-	}
-
-	void read_bytes(void *v, size_t sz)
-	{
-		memcpy(v, &peek, 1);
-		o.get(static_cast<C *>(v) + 1, sz);
-		o.get(peek);
-	}
-
-	size_t enter()
-	{
-		uint32_t v;
-		size_t at = o.tellg();
-		read_bytes(&v, 4);
-		return at + v;
-	}
-	void leave(size_t at)
-	{
-		o.seekg(at);
-	}
-
-	bool end() const
-	{
-		return o.eof();
-	}
-
-	bool ok()
-	{
-		return o.good();
 	}
 
 	std::basic_istream<C, T>& o;
-	// The peekahead byte is required to handle istreams eof condition which isn't discovered until you try to
-	// read the byte. This also lets us implement the peek_u8 functionality easily.
-	uint8_t peek;
 };
 
-template<options opts, typename Container>
-using serializer_t = detail::bytes_converter<opts & options::variable_length_encoding, container_wrapper<Container>>;
+template<options opts = options::none>
+using serializer_t = detail::bytes_converter<opts & options::variable_length_encoding>;
 
 } // namespace packall
 
