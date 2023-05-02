@@ -172,3 +172,50 @@ TEST(packall, limits)
 	test_limits<uint32_t>();
 	test_limits<uint64_t>();
 }
+
+
+
+
+class base
+{
+public:
+	virtual void pack(packall::bytebuffer& b) = 0;
+	virtual void unpack(packall::bytebuffer& b) = 0;
+	virtual size_t pack_type_id() = 0;
+
+	static std::unique_ptr<base> pack_create_as(size_t type);
+};
+
+class derived1 : public base
+{
+	// Inherited via base
+	void pack(packall::bytebuffer& b) override {}
+	void unpack(packall::bytebuffer& b) override {}
+	size_t pack_type_id() override
+	{
+		return 1;
+	}
+};
+
+std::unique_ptr<base> base::pack_create_as(size_t type)
+{
+	if(type == 1)
+		return std::make_unique<derived1>();
+	return nullptr;
+}
+
+
+TEST(packall, polymorphic)
+{
+	struct s
+	{
+		std::unique_ptr<base> impl;
+	} x{std::make_unique<derived1>()};
+
+	std::vector<uint8_t> bytes;
+	packall::pack(x, bytes);
+
+	s new_x;
+	EXPECT_EQ(packall::unpack(new_x, bytes), packall::status::ok);
+	EXPECT_TRUE(new_x.impl);
+}

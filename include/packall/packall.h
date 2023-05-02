@@ -550,7 +550,6 @@ struct bytes_converter
 	}
 
 	bytebuffer& wrap;
-
 };
 
 template<typename T>
@@ -788,9 +787,8 @@ struct typeinfo<T>
 	static constexpr bool is_backwards_compatible = struct_traits<T>::Traits & traits::backwards_compatible;
 	static constexpr size_t predecode_info =
 	    (Arity > 0 ? calculate_predecode<T, Arity>(std::make_index_sequence<Arity>()) : 0) * 4 + 2 +
-		(is_backwards_compatible ? 1 : 0);
+	    (is_backwards_compatible ? 1 : 0);
 	static constexpr bool use_predecode = !(struct_traits<T>::Traits & traits::immutable);
-
 
 	template<typename Container>
 	static void pack(T& obj, Container& out)
@@ -1496,7 +1494,7 @@ struct typeinfo<std::vector<bool, A>>
 template<is_container T, typename D>
 struct typeinfo<std::unique_ptr<T, D>>
 {
-	using type = std::unique_ptr<T>;
+	using type = std::unique_ptr<T, D>;
 
 	static constexpr uint8_t type_id = static_cast<uint8_t>(type_id::unique_ptr);
 	template<typename Container>
@@ -1535,7 +1533,7 @@ struct typeinfo<std::unique_ptr<T, D>>
 template<is_aggregate_struct T, typename D>
 struct typeinfo<std::unique_ptr<T, D>>
 {
-	using type = std::unique_ptr<T>;
+	using type = std::unique_ptr<T, D>;
 
 	static constexpr uint8_t type_id = static_cast<uint8_t>(type_id::unique_ptr);
 	template<typename Container>
@@ -1555,6 +1553,53 @@ struct typeinfo<std::unique_ptr<T, D>>
 			typeinfo<T>::unpack(*obj.get(), in);
 		} else {
 			in.read_u8();
+		}
+	}
+
+	static constexpr void get_types(type_list& t)
+	{
+		t.types.push_back(type_id);
+		typeinfo<T>::get_types(t);
+	}
+
+	template<typename Foreach>
+	static void for_each(const char *name, type& obj, Foreach& c)
+	{
+		c.visit(0, name, obj);
+	}
+};
+
+template<typename T>
+concept is_custom_polymorphic =
+    std::is_abstract_v<T> && is_custom_serialized<T> && requires(T t) {
+	                                                        t.pack_type_id();
+	                                                        T::pack_create_as(t.pack_type_id());
+                                                        };
+
+template<is_custom_polymorphic T, typename D>
+struct typeinfo<std::unique_ptr<T, D>>
+{
+	using type = std::unique_ptr<T, D>;
+
+	static constexpr uint8_t type_id = static_cast<uint8_t>(type_id::unique_ptr);
+	template<typename Container>
+	static void pack(const type& obj, Container& out)
+	{
+		if(obj) {
+			typeinfo<decltype(obj->pack_type_id())>::pack(obj->pack_type_id(), out);
+			typeinfo<T>::pack(*obj, out);
+		} else {
+			out.write((uint8_t)0);
+		}
+	}
+	template<typename Container>
+	static void unpack(type& obj, Container& in)
+	{
+		decltype(obj->pack_type_id()) info;
+		typeinfo<decltype(info)>::unpack(info, in);
+		obj = T::pack_create_as(info);
+		if(obj) {
+			typeinfo<T>::unpack(*obj.get(), in);
 		}
 	}
 
@@ -1920,8 +1965,6 @@ concept is_vectorlike_container = requires(T t, uint8_t v) {
 	                                  t.size();
                                   };
 
-
-
 template<is_vectorlike_container T>
 struct bytebuffer_impl<T> : public bytebuffer
 {
@@ -1982,27 +2025,21 @@ struct bytebuffer_impl<std::span<uint8_t>> : public bytebuffer
 		e = s + o.size();
 	}
 
-	~bytebuffer_impl()
-	{
-	}
+	~bytebuffer_impl() {}
 
 	void more_data(size_t n) override
 	{
 		if(n > 0)
 			throw status::data_underrun;
 	}
-	void more_buffer(size_t n) override
-	{
-	}
+	void more_buffer(size_t n) override {}
 	void seek_to(size_t at) override
 	{
 		if(at >= o.size())
 			throw status::data_underrun;
 		p = s + at;
 	}
-	void fix_offset(size_t at, uint32_t n) override
-	{
-	}
+	void fix_offset(size_t at, uint32_t n) override {}
 	void flush_all() override {}
 
 	std::span<uint8_t> o;
@@ -2026,9 +2063,7 @@ struct bytebuffer_impl<std::basic_ostream<C, T>> : public bytebuffer
 		o.write(s, p - s);
 	}
 
-	void more_data(size_t n) override
-	{
-	}
+	void more_data(size_t n) override {}
 	void more_buffer(size_t n) override
 	{
 		o.write(s, p - s);
@@ -2039,9 +2074,7 @@ struct bytebuffer_impl<std::basic_ostream<C, T>> : public bytebuffer
 			e = p + n;
 		}
 	}
-	void seek_to(size_t at) override
-	{
-	}
+	void seek_to(size_t at) override {}
 	void fix_offset(size_t at, uint32_t n) override
 	{
 		memcpy(o.data() + at, &n, 4);
@@ -2055,12 +2088,8 @@ struct bytebuffer_impl<std::basic_ostream<C, T>> : public bytebuffer
 template<typename C, typename T>
 struct bytebuffer_impl<std::basic_istream<C, T>>
 {
-	bytebuffer_impl(std::basic_istream<C, T>& o) : o(o)
-	{
-	}
-	~bytebuffer_impl()
-	{
-	}
+	bytebuffer_impl(std::basic_istream<C, T>& o) : o(o) {}
+	~bytebuffer_impl() {}
 
 	std::basic_istream<C, T>& o;
 };
