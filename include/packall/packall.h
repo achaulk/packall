@@ -553,12 +553,28 @@ struct bytes_converter
 };
 
 template<typename T>
+concept has_member_names = requires() { T::kMembers; };
+
+template<has_member_names T, size_t Index>
+constexpr const char *get_member_name()
+{
+	return T::kMembers[Index];
+}
+
+template<typename T, size_t Index>
+constexpr const char *get_member_name()
+{
+	return nullptr;
+}
+
+template<typename T>
 struct get_member_index_helper
 {
-	static constexpr bool helper2(uint32_t& out, uint32_t index, std::string_view name)
+	template<size_t Index>
+	static constexpr bool helper2(uint32_t& out, std::string_view name)
 	{
-		if(name == T::kMembers[index]) {
-			out = index;
+		if(name == get_member_name<T, Index>()) {
+			out = Index;
 			return true;
 		}
 		return false;
@@ -568,7 +584,7 @@ struct get_member_index_helper
 	static constexpr uint32_t helper(std::string_view name, std::index_sequence<Index...>)
 	{
 		uint32_t o = ~0u;
-		(helper2(o, Index, name) || ...);
+		(helper2<Index>(o, name) || ...);
 		return o;
 	}
 };
@@ -898,7 +914,7 @@ struct typeinfo<T>
 	template<typename Foreach, size_t... Index>
 	static void foreach_helper(type& obj, Foreach& c, std::index_sequence<Index...>)
 	{
-		(c.visit(Index, type::kMembers[Index],
+		(c.visit(Index, get_member_name<type, Index>(),
 		     decompose<Arity>::template get<Index>(static_cast<std::remove_reference_t<T>&&>(obj))),
 		    ...);
 	}

@@ -20,13 +20,22 @@ struct parse_options
 	bool allow_unknown_tuple_elements = true;
 	// Ignore extra entries for std::array & C arrays
 	bool allow_extra_array_entries = true;
+
+	bool skip_initial_scope = false;
+};
+
+struct format_options
+{
+	// If set, omit any value that is a default value
+	bool omit_default = false;
+	// If set, omit all struct keys
+	bool omit_names = false;
+
+	bool skip_initial_scope = false;
 };
 
 template<typename T>
-void parse(T& obj, std::string_view text, const parse_options& opts);
-
-template<typename T>
-void unparse(const T& obj, std::string& text);
+status parse(T& obj, std::string_view text, const parse_options& opts);
 
 namespace detail {
 template<typename T>
@@ -211,12 +220,13 @@ struct parse_state
 			table_key = std::string_view(start, s);
 			skip_ws();
 			if(s == e || *s != '=')
-				throw status::bad_format;
+				return false;
 			s++;
 			skip_ws();
 			return true;
 		}
 		if(*s == '[') {
+			const char *o = s;
 			s++;
 			skip_ws();
 			if(*s == '"' || *s == '\'') {
@@ -226,8 +236,13 @@ struct parse_state
 				return true;
 			}
 			table_key = parse_long_string();
+			skip_ws();
+			if(*s == '=') {
+				return true;
+			}
+			s = o;
 		}
-		throw status::bad_format;
+		return false;
 	}
 	bool table_next()
 	{
@@ -349,45 +364,32 @@ struct key_parser<std::variant<V...>>
 
 // Mirror the main set of structs
 
-template<is_aggregate_struct T>
-struct parser<T>
+struct seqparser
+{
+	parse_state& s;
+	bool done = false;
+
+	constexpr void enter(std::string_view name) {}
+	constexpr void leave() {}
+
+	template<typename U>
+	void visit(uint32_t index, const char *name, U& obj)
+	{
+		if(!done) {
+			parser<U>::parse(obj, s);
+			if(!s.table_next()) {
+				s.table_end();
+				done = true;
+			}
+		}
+	}
+};
+
+struct nameparser
 {
 	parse_state& s;
 	uint32_t target;
 
-	static void parse(T& obj, parse_state& s)
-	{
-		if(s.depth++ > s.opts.max_depth) [[unlikely]] {
-			throw status::stack_overflow;
-		}
-		s.table_begin();
-		while(s.table_literal_key()) {
-			uint32_t index = get_member_index<T>(s.table_key);
-			if(index > typeinfo<T>::Arity) [[unlikely]] {
-				if(!s.opts.allow_unknown_keys) [[unlikely]] {
-					throw status::unknown_key;
-				}
-				// Need to skip
-				s.skip_element();
-			} else {
-				parser p{s, index};
-				foreach_member(obj, p);
-			}
-			if(!s.table_next()) {
-				s.table_end();
-				break;
-			}
-		}
-		s.depth--;
-	}
-
-	// This checks if it's worth maybe trying to parse this
-	static bool precheck_parse(const char *s, const char *e)
-	{
-		return *s == '{';
-	}
-
-	// foreach implementation
 	constexpr void enter(std::string_view name) {}
 	constexpr void leave() {}
 
@@ -397,6 +399,56 @@ struct parser<T>
 		if(index == target) {
 			parser<U>::parse(obj, s);
 		}
+	}
+};
+
+template<is_aggregate_struct T>
+struct parser<T>
+{
+	static void parse(T& obj, parse_state& s)
+	{
+		if(s.depth++ > s.opts.max_depth) [[unlikely]] {
+			throw status::stack_overflow;
+		}
+		bool skip = s.opts.skip_initial_scope;
+		s.opts.skip_initial_scope = false;
+		if(!skip) {
+			[[likely]] s.table_begin();
+			if(s.maybe('}'))
+				return;
+		}
+		if(s.table_literal_key()) {
+			do {
+				uint32_t index = get_member_index<T>(s.table_key);
+				if(index > typeinfo<T>::Arity) [[unlikely]] {
+					if(!s.opts.allow_unknown_keys) [[unlikely]] {
+						throw status::unknown_key;
+					}
+					// Need to skip
+					s.skip_element();
+				} else {
+					nameparser p{s, index};
+					foreach_member(obj, p);
+				}
+				if(!s.table_next()) {
+					if(!skip) [[likely]]
+						s.table_end();
+					break;
+				}
+			} while(s.table_literal_key());
+		} else {
+			seqparser seq{s};
+			foreach_member(obj, seq);
+			if(!skip) [[likely]]
+				s.table_end();
+		}
+		s.depth--;
+	}
+
+	// This checks if it's worth maybe trying to parse this
+	static bool precheck_parse(const char *s, const char *e)
+	{
+		return *s == '{';
 	}
 };
 
@@ -642,8 +694,8 @@ struct parser<std::tuple<V...>>
 
 struct writer_state
 {
+	format_options opts;
 	std::string o;
-	bool omit_default = false;
 
 	void newscope()
 	{
@@ -768,11 +820,15 @@ struct writer<T>
 	static void write(const T& obj, writer_state& s)
 	{
 		size_t at = s.o.size();
-		s.newscope();
+		bool skip = s.opts.skip_initial_scope;
+		s.opts.skip_initial_scope = false;
+		if(!skip) [[likely]]
+			s.newscope();
 		writer<T> wr{s};
 		foreach_member(const_cast<T&>(obj), wr);
-		s.endscope();
-		if(wr.n == 0 && s.omit_default)
+		if(!skip) [[likely]]
+			s.endscope();
+		if(wr.n == 0 && s.opts.omit_default)
 			s.o.resize(at);
 	}
 
@@ -782,15 +838,17 @@ struct writer<T>
 	template<typename U>
 	void visit(uint32_t index, const char *name, U& obj)
 	{
-		if(s.omit_default && is_default_value(obj))
+		if(s.opts.omit_default && is_default_value(obj))
 			return;
 		n++;
 		// Generally a C++ name can also be a valid Lua name with the only difference being keywords
 		// and break do else false for goto if not or return true while are C++ keywords too
 		// elseif end function in local nil repeat then until are not
 		s.prefix();
-		s.o.append(name);
-		s.o.push_back('=');
+		if(name && !s.opts.omit_names) {
+			s.o.append(name);
+			s.o.push_back('=');
+		}
 		writer<U>::write(obj, s);
 		s.next();
 	}
@@ -933,7 +991,7 @@ struct writer<std::tuple<V...>>
 	{
 		size_t at = s.o.size();
 		s.newscope();
-		if(write_helper(obj, s, std::make_index_sequence<sizeof...(V)>()) || !s.omit_default) {
+		if(write_helper(obj, s, std::make_index_sequence<sizeof...(V)>()) || !s.opts.omit_default) {
 			s.endscope();
 			return true;
 		}
@@ -950,7 +1008,7 @@ struct writer<std::tuple<V...>>
 	template<size_t I>
 	static size_t write_one(const type& obj, writer_state& s)
 	{
-		if(s.omit_default && is_default_value(std::get<I>(obj)))
+		if(s.opts.omit_default && is_default_value(std::get<I>(obj)))
 			return 0;
 		writer<std::tuple_element_t<I, type>>::write(std::get<I>(obj), s);
 		s.next();
@@ -1216,9 +1274,9 @@ inline status parse(T& obj, std::string_view text, const parse_options& opts = p
 }
 
 template<typename T>
-inline void format(const T& obj, std::string& text)
+inline void format(const T& obj, std::string& text, const format_options& opts = format_options())
 {
-	detail::writer_state s;
+	detail::writer_state s{opts};
 	detail::writer<T>::write(obj, s);
 	text.swap(s.o);
 }

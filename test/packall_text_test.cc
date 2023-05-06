@@ -38,3 +38,22 @@ TEST(packall_text, Config)
 	EXPECT_EQ(text_c.distortion_coeffients, c.distortion_coeffients);
 	EXPECT_EQ(text_c.parameters, c.parameters);
 }
+
+TEST(packall_text, no_members)
+{
+	struct point
+	{
+		float x, y, z;
+		bool operator==(const point&) const = default;
+	} pt{1.1f, 2.0, 3.0};
+
+	std::string text;
+	packall::format(pt, text);
+
+	printf("%s\n", packall::prettyprint(text).c_str());
+
+	point pt2{};
+	packall::parse(pt2, text);
+
+	EXPECT_EQ(pt2, pt);
+}
