@@ -29,12 +29,10 @@ TEST(packall, Config)
 
 struct optional_limits
 {
-	static constexpr size_t Arity = 2;
-
 	int x;
 	std::optional<int> y;
 };
-static_assert(packall::detail::aggregate_arity<optional_limits>::value == 1);
+static_assert(packall::detail::aggregate_arity<optional_limits>::value == 2);
 static_assert(packall::detail::aggregate_arity_calc<optional_limits>::Arity == 2);
 
 TEST(packall, explicit_arity)
@@ -48,6 +46,15 @@ TEST(packall, explicit_arity)
 	EXPECT_EQ(packall::unpack(b, bytes), packall::status::ok);
 	EXPECT_EQ(b.x, a.x);
 	EXPECT_EQ(b.y, a.y);
+}
+
+TEST(packall, empty)
+{
+	struct empty
+	{
+	} a;
+	std::vector<uint8_t> bytes;
+	packall::pack(a, bytes);
 }
 
 struct custom_struct
@@ -218,4 +225,20 @@ TEST(packall, polymorphic)
 	s new_x;
 	EXPECT_EQ(packall::unpack(new_x, bytes), packall::status::ok);
 	EXPECT_TRUE(new_x.impl);
+}
+
+TEST(packall, views)
+{
+	struct s
+	{
+		std::string_view sv;
+		std::span<std::byte> b;
+	} x{"test"};
+
+	std::vector<uint8_t> bytes;
+	packall::pack(x, bytes);
+
+	s new_x;
+	EXPECT_EQ(packall::unpack(new_x, bytes), packall::status::ok);
+	EXPECT_EQ(new_x.sv, x.sv);
 }

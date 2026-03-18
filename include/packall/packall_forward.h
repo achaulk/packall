@@ -44,6 +44,7 @@ enum class status
 	out_of_memory,
 	write_disallowed,
 	read_disallowed,
+	read_disjoint_into_span,
 };
 
 enum class traits : uint8_t

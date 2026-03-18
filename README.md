@@ -77,7 +77,8 @@ Structs operate in one of three compatiblity modes
 
 #### Containers
 Concepts are used to not require specific implementations for every container type.
-Three containers are implemented
+Four containers are implemented
+* spanlikes must implement `data()` and `T(ptr, size)` construction and provide `value_type`.
 * listlikes must implement `resize(size_t)` and provide `value_type`.
 * setlikes must implement `emplace(T&&)` and provide `key_type`.
 * maplikes must implement `emplace(T&&, K&&)` and must permit unpacking via `auto& [k, v] : map` and must provide `key_type` and  `mapped_type`.
@@ -94,8 +95,6 @@ All integral and floating point types are supported.
 ##### `std::optional<T>` & `std::unique_ptr<T>`
 This is used to signal a maybe-missing object. The format is capable of distinguishing between a missing and an empty object. For [special](#special-types) types the encoding is zero-cost and may freely switch between direct-declared, unique_ptr/optional and deprecated.
 
-Note that `std::optional` requires [explicitly specifying](#manually-specifying-size) the struct size.
-
 ##### `packall::deprecated<T>`
 If used with a special type this replaces the serialization with a single byte (as if it were an empty vector, empty struct, etc), it also effectively removes this member from the struct. If used with other types, it will serialize a default-constructed object.
 
@@ -111,11 +110,12 @@ This prevents any encoding or decoding. Additionally in structs these are wholly
 
 `enum` and `enum class` are supported, encoding as whatever `std::underlying_type_t<T>` is. No validation is performed that the decoded value is in fact valid.
 
-`std::string_view` is supported for encoding only.
 `std::vector<bool>` is supported as a special case.
 
+Decoding into `span`s and `string_view`s is supported, however as these don't allocate/copy memory they can leads to access errors.
+
 #### Custom encoding
-Certain things, like raw or `shared_ptr` are not encodable, largely because this does not handle arbitrary topologies, it's not designed to encode many references to a single object, pointers with cycles and so on.
+Certain things, like raw pointers or `shared_ptr` are not encodable, largely because this does not handle arbitrary topologies, it's not designed to encode many references to a single object, pointers with cycles and so on.
 
 To support arbitrary encoding, an object can implement the following
 ```cpp
@@ -150,6 +150,7 @@ struct
 	// Decode interface
 	void read(PrimitiveType&);
 	void readbuf(void *buf, size_t sz);
+	void spanbuf(Span& span, size_t bytes);
 	uint8_t peek_u8();
 	uint8_t read_u8();
 	size_t read_sz();
@@ -216,14 +217,14 @@ In addition, in any struct
 If the buffer being decoded has a known size then the toplevel struct is effectively `backwards_compatible` by default as decoding may stop on any struct member boundary.
 
 #### Containers
-All non-map containers can be freely interchanged. There is no encoding level difference between a `std::vector` and a `std::list`.
+All non-map containers can be freely interchanged. There is no encoding level difference between a `std::vector` and a `std::list`. Specifically, spanlikes, listlike and setlikes are encoded identially.
 
 A map can be changed to a non-map containing `std::pair<K, V>` or an immutable two entry struct.
 
 #### Primitives
 If a buffer is using variable-length encoding, any non-8bit integer value can be extended, eg `uint16_t` to `uint32_t` but this may break older code if a too-large value is written.
 
-If a buffer is using fixed-length encoding, any integer may change it's sign.
+If a buffer is using fixed-length encoding, any integer may change it's signedness.
 
 `bool`, `char`, `int8_t` and `uint8_t` can always be interchanged.
 
@@ -233,7 +234,7 @@ Any deprecated entry may be replaced with `packall::deprecated<T>`. This is guar
 #### Other
 `std::tuple` follows the same rules as structs, except that `omit<T>` counts as a type change and tuples cannot specify compatibility options
 
-`std::variant` can add new types at will and will only cause issues if unknown types are passed to older code.
+`std::variant` can add new types at will and will only cause issues if unknown types are passed to older code. Removing types is never allowed.
 
 `std::unique_ptr` and `std::optional` encode identially. Additionally, if T is a struct or tuple or container it can be replaced with the same type inline.
 
@@ -241,7 +242,7 @@ Any deprecated entry may be replaced with `packall::deprecated<T>`. This is guar
 Acceptable containers include:
 * `std::vector<uint8_t>`
 * `std::span<uint8_t>` for decoding
-* `std::ostream` & `std::istream`
+* `std::ostream`
 Additionally other containers that look similar to a vector (having push_back, data & size) may match the concept and work automatically.
 
 To implement a custom container, you can provide a specialization as follows
@@ -274,7 +275,7 @@ No struct, variant or tuple may contain more than 250 entries (technically some 
 Struct decoding past 50 elements must be provided explicitly (see struct_decompose.inc).
 
 ### Manually specifying size
-If a struct uses C arrays or `std::optional` then you must specify an Arity member as below.
+If a struct uses C arrays then you must specify an Arity member as below.
 ```cpp
 struct MyStruct
 {
@@ -334,7 +335,7 @@ Strings can use 'single' or "double" quotes, but also [[long strings containing 
 Bool is either `true` or `false`
 Numbers follow the usual default decimal integers, `0x` prefixed hexadecimal integers, standard and scientific floating point and `0x` prefixed hex float.
 
-To serialize a struct you must provide names.
+To serialize a struct you *may* provide names. Structs without names will extract the names automatrically.
 ```cpp
 struct MyStruct
 {
@@ -352,9 +353,6 @@ struct Config {
 	std::array<double, 9> K_matrix;
 	std::vector<double> distortion_coeffients;
 	std::map<std::string, std::variant<uint16_t, std::string, bool>> parameters;
-
-	static constexpr const char *kMembers[] = {
-	    "device", "resolution", "K_matrix", "distortion_coeffients", "parameters"};
 };
 
 // Construct the object
@@ -369,7 +367,7 @@ Config c{"/dev/video0", {640, 480},
 	  {"model_path", std::string{"foo/bar.pt"}}}};
 
 std::string text;
-packall::format(c, text);
+packall::lua::format(c, text);
 ```
 encodes to
 ```lua
@@ -404,3 +402,7 @@ encodes to
         },
 }
 ```
+
+
+JSON is also supported but only supports simple schemas, eg no int -> int maps.
+Use the `packall::json` namespace.

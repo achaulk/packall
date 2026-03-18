@@ -7,7 +7,7 @@
 
 #include <charconv>
 
-namespace packall {
+namespace packall::lua {
 struct parse_options
 {
 	// Maximum parse depth allowed. Returns stack_overflow is this is exceeded.
@@ -38,11 +38,13 @@ template<typename T>
 status parse(T& obj, std::string_view text, const parse_options& opts);
 
 namespace detail {
+using namespace ::packall::detail;
+
 template<typename T>
 concept is_custom_text_serialized = requires(T t) {
-	                                    t.parse;
-	                                    t.format;
-                                    };
+	t.parse;
+	t.format;
+};
 
 template<typename T>
 constexpr bool is_default_value(const T&)
@@ -373,7 +375,7 @@ struct seqparser
 	constexpr void leave() {}
 
 	template<typename U>
-	void visit(uint32_t index, const char *name, U& obj)
+	void visit(uint32_t index, std::string_view name, U& obj)
 	{
 		if(!done) {
 			parser<U>::parse(obj, s);
@@ -394,7 +396,7 @@ struct nameparser
 	constexpr void leave() {}
 
 	template<typename U>
-	void visit(uint32_t index, const char *name, U& obj)
+	void visit(uint32_t index, std::string_view name, U& obj)
 	{
 		if(index == target) {
 			parser<U>::parse(obj, s);
@@ -412,8 +414,8 @@ struct parser<T>
 		}
 		bool skip = s.opts.skip_initial_scope;
 		s.opts.skip_initial_scope = false;
-		if(!skip) {
-			[[likely]] s.table_begin();
+		if(!skip) [[likely]] {
+			s.table_begin();
 			if(s.maybe('}'))
 				return;
 		}
@@ -550,10 +552,10 @@ struct parser<T>
 	}
 };
 
-template<>
-struct parser<std::string>
+template<is_stringlike T>
+struct parser<T>
 {
-	static void parse(std::string& obj, parse_state& s)
+	static void parse(T& obj, parse_state& s)
 	{
 		obj = s.parse_string();
 	}
@@ -564,6 +566,7 @@ struct parser<std::string>
 };
 
 template<is_listlike T>
+    requires(!is_stringlike<T>)
 struct parser<T>
 {
 	static void parse(T& obj, parse_state& s)
@@ -613,6 +616,7 @@ template<is_maplike T>
 struct parser<T>
 {
 	using K = typename T::key_type;
+	static_assert(is_stringlike<K>, "JSON only supports string-like keys");
 	static void parse(T& obj, parse_state& s)
 	{
 		s.table_begin();
@@ -769,10 +773,10 @@ struct key_writer
 	}
 };
 
-template<>
-struct key_writer<std::string>
+template<is_stringlike T>
+struct key_writer<T>
 {
-	static void write(const std::string& obj, writer_state& s)
+	static void write(const T& obj, writer_state& s)
 	{
 		s.writestr(obj);
 	}
@@ -836,7 +840,7 @@ struct writer<T>
 	constexpr void leave() {}
 
 	template<typename U>
-	void visit(uint32_t index, const char *name, U& obj)
+	void visit(uint32_t index, std::string_view name, U& obj)
 	{
 		if(s.opts.omit_default && is_default_value(obj))
 			return;
@@ -845,7 +849,7 @@ struct writer<T>
 		// and break do else false for goto if not or return true while are C++ keywords too
 		// elseif end function in local nil repeat then until are not
 		s.prefix();
-		if(name && !s.opts.omit_names) {
+		if(!s.opts.omit_names) {
 			s.o.append(name);
 			s.o.push_back('=');
 		}
@@ -931,10 +935,10 @@ struct writer<bool>
 	}
 };
 
-template<>
-struct writer<std::string>
+template<is_stringlike T>
+struct writer<T>
 {
-	using type = std::string;
+	using type = T;
 	static void write(const type& obj, writer_state& s)
 	{
 		s.writestr(obj);
@@ -1289,6 +1293,900 @@ inline std::string prettyprint(std::string_view in)
 	return s;
 }
 
-} // namespace packall
+} // namespace packall::lua
+
+namespace packall::json {
+
+struct parse_options
+{
+	// Maximum parse depth allowed. Returns stack_overflow is this is exceeded.
+	uint32_t max_depth = 256;
+	// Allow unknown names for structs
+	bool allow_unknown_keys = true;
+	// Leaves the variant default-constructed if no types can parse the value
+	bool allow_unknown_variant_values = true;
+	// Ignore extra entries for tuples
+	bool allow_unknown_tuple_elements = true;
+	// Ignore extra entries for std::array & C arrays
+	bool allow_extra_array_entries = true;
+
+	bool skip_initial_scope = false;
+};
+
+struct format_options
+{
+	// If set, omit any value that is a default value
+	bool omit_default = false;
+	// If set, omit all struct keys
+	bool omit_names = false;
+
+	bool skip_initial_scope = false;
+};
+
+template<typename T>
+status parse(T& obj, std::string_view text, const parse_options& opts);
+
+namespace detail {
+using namespace ::packall::detail;
+
+struct parse_state
+{
+	parse_options opts;
+	const char *s, *e;
+	std::string_view token;
+	uint32_t depth = 0;
+
+	bool maybe_nil()
+	{
+		if(e - s >= 4 && s[0] == 'n' && s[1] == 'u' && s[2] == 'l' && s[3] == 'l') {
+			s += 4;
+			return true;
+		}
+		return false;
+	}
+
+	void next()
+	{
+		skip_ws();
+	}
+	void skip_ws()
+	{
+		while(s < e && (*s == ' ' || *s == '\t' || *s == '\r' || *s == '\n')) s++;
+		if(s + 1 < e && s[0] == '/' && s[1] == '/') {
+			// comment!
+			s += 2;
+			skip_comment();
+			skip_ws();
+		}
+	}
+	void skip_comment()
+	{
+	}
+	void expect(char ch)
+	{
+		if(s == e || *s != ch)
+			throw status::bad_format;
+		s++;
+		skip_ws();
+	}
+	void consume(char ch)
+	{
+		if(s != e && *s == ch) {
+			s++;
+			skip_ws();
+		}
+	}
+	bool maybe(char ch)
+	{
+		if(*s == ch) {
+			s++;
+			skip_ws();
+			return true;
+		}
+		return false;
+	}
+	std::string_view parse_ident()
+	{
+		if((*s >= 'a' && *s <= 'z') || (*s >= 'A' && *s <= 'Z') || *s == '_') {
+			const char *start = s++;
+			while(
+			    s < e && (*s >= 'a' && *s <= 'z') || (*s >= 'A' && *s <= 'Z') || *s == '_' || (*s >= '0' && *s <= '9'))
+				s++;
+			const char *end = s;
+			skip_ws();
+			return std::string_view(start, end);
+		}
+		throw status::bad_format;
+	}
+
+	void skip_element()
+	{
+		throw status::bad_data;
+	}
+
+	status finish()
+	{
+		return status::ok;
+	}
+
+	std::string_view table_key;
+	bool table_kv;
+
+	void obj_begin()
+	{
+		expect('{');
+	}
+	void obj_end()
+	{
+		expect('}');
+	}
+	void arr_begin()
+	{
+		expect('[');
+	}
+	void arr_end()
+	{
+		expect(']');
+	}
+	bool table_array_implicit_key()
+	{
+		return !maybe(']');
+	}
+	bool table_next()
+	{
+		if(*s == ',') {
+			s++;
+			skip_ws();
+			return true;
+		}
+		return false;
+	}
+
+	template<typename T>
+	void parse_primitive(T& v)
+	{
+		auto r = std::from_chars(s, e, v);
+		if(r.ec == std::errc::invalid_argument || r.ec == std::errc::result_out_of_range)
+			throw status::bad_format;
+		s = r.ptr;
+	}
+	void parse_primitive(bool& v)
+	{
+		auto str = parse_ident();
+		if(str == "true")
+			v = true;
+		else if(str == "false")
+			v = false;
+		else
+			throw status::bad_format;
+	}
+
+	std::string parse_string()
+	{
+		if(*s == '"') {
+			std::string str;
+			const char *start = ++s;
+			while(s < e && *s != '"') {
+				if(*s == '\\') [[unlikely]] {
+					s++;
+					if(s == e) [[unlikely]] {
+						throw status::bad_format;
+					}
+					switch(*s) {
+					case '"':
+					case '\\':
+					case '/':
+						break;
+					case 'b':
+						str.push_back('\b');
+						continue;
+					case 'f':
+						str.push_back('\f');
+						continue;
+					case 'n':
+						str.push_back('\n');
+						continue;
+					case 'r':
+						str.push_back('\r');
+						continue;
+					case 't':
+						str.push_back('\t');
+						continue;
+					case 'u':
+						s++;
+						throw status::incompatible;
+						continue;
+					default:
+						throw status::bad_format;
+					}
+				}
+				str.push_back(*s++);
+			}
+			if(s == e) [[unlikely]]
+				throw status::bad_format;
+			s++;
+			skip_ws();
+			return str;
+		}
+
+		throw status::bad_format;
+	}
+	std::string_view parse_name_string()
+	{
+		if(*s == '"') {
+			const char *start = ++s;
+			while(s < e && *s != '"') {
+				if(*s == '\\') [[unlikely]] {
+					throw status::bad_format;
+				}
+				s++;
+			}
+			if(s == e) [[unlikely]]
+				throw status::bad_format;
+			auto e = s++;
+			skip_ws();
+			return std::string_view(start, e);
+		}
+
+		throw status::bad_format;
+	}
+};
+
+template<typename T>
+struct parser;
+
+struct nameparser
+{
+	parse_state& s;
+	uint32_t target;
+
+	constexpr void enter(std::string_view name) {}
+	constexpr void leave() {}
+
+	template<typename U>
+	void visit(uint32_t index, std::string_view name, U& obj)
+	{
+		if(index == target) {
+			parser<U>::parse(obj, s);
+		}
+	}
+};
+
+template<>
+struct parser<bool>
+{
+	static void parse(bool& obj, parse_state& s)
+	{
+		s.parse_primitive(obj);
+	}
+	static bool precheck_parse(const char *s, const char *e)
+	{
+		return *s == 't' || *s == 'f';
+	}
+};
+
+template<std::integral T>
+struct parser<T>
+{
+	static void parse(T& obj, parse_state& s)
+	{
+		int base = 10;
+		if(s.s[0] == '0' && s.s[1] == 'x') {
+			s.s += 2;
+			base = 16;
+		}
+		auto r = std::from_chars(s.s, s.e, obj, base);
+		if(r.ec == std::errc::invalid_argument || r.ec == std::errc::result_out_of_range)
+			throw status::bad_format;
+		s.s = r.ptr;
+	}
+	static bool precheck_parse(const char *s, const char *e)
+	{
+		// Hex & octal start with 0
+		return *s == '-' || (*s >= '0' && *s <= '9');
+	}
+};
+
+template<std::floating_point T>
+struct parser<T>
+{
+	static void parse(T& obj, parse_state& s)
+	{
+		s.parse_primitive(obj);
+	}
+	static bool precheck_parse(const char *s, const char *e)
+	{
+		// Hex & octal start with 0
+		return *s == '-' || *s == '.' || (*s >= '0' && *s <= '9');
+	}
+};
+
+template<is_stringlike T>
+struct parser<T>
+{
+	static void parse(T& obj, parse_state& s)
+	{
+		obj = s.parse_string();
+	}
+	static bool precheck_parse(const char *s, const char *e)
+	{
+		return *s == '"';
+	}
+};
+
+// T[N] & array<T, N>
+template<typename T>
+    requires(std::is_aggregate_v<T> && is_array_type<T>::value)
+struct parser<T>
+{
+	using type = typename is_array_type<T>::type;
+	static constexpr uint32_t N = is_array_type<T>::kN;
+
+	static void parse(T *obj, parse_state& s)
+	{
+		s.arr_begin();
+		size_t i = 0;
+		while(s.table_array_implicit_key()) {
+			if(i < N) {
+				parser<type>::parse(obj[i++], s);
+			} else {
+				type _;
+				parser<type>::parse(_, s);
+			}
+			if(!s.table_next()) {
+				s.arr_end();
+				break;
+			}
+		}
+	}
+
+	static void parse(std::array<type, N>& obj, parse_state& s)
+	{
+		s.arr_begin();
+		size_t i = 0;
+		while(s.table_array_implicit_key()) {
+			if(i < N) {
+				parser<type>::parse(obj[i++], s);
+			} else {
+				type _;
+				parser<type>::parse(_, s);
+			}
+			if(!s.table_next()) {
+				s.arr_end();
+				break;
+			}
+		}
+	}
+	static bool precheck_parse(const char *s, const char *e)
+	{
+		return *s == '[';
+	}
+};
+
+template<is_listlike T>
+    requires(!is_stringlike<T>)
+struct parser<T>
+{
+	static void parse(T& obj, parse_state& s)
+	{
+		s.arr_begin();
+		while(s.table_array_implicit_key()) {
+			obj.emplace_back();
+			parser<typename T::value_type>::parse(obj.back(), s);
+			if(!s.table_next()) {
+				s.arr_end();
+				break;
+			}
+		}
+	}
+	static bool precheck_parse(const char *s, const char *e)
+	{
+		return *s == '[';
+	}
+};
+
+template<typename T, typename U>
+struct parser<std::pair<T, U>>
+{
+	using type = std::pair<T, U>;
+
+	static void parse(type& obj, parse_state& s)
+	{
+		s.arr_begin();
+		if(!s.table_array_implicit_key())
+			throw status::bad_format;
+		parser<T>::parse(obj.first, s);
+		if(!s.table_next())
+			throw status::bad_format;
+		if(!s.table_array_implicit_key())
+			throw status::bad_format;
+		parser<T>::parse(obj.second, s);
+		s.table_next();
+		s.arr_end();
+	}
+	static bool precheck_parse(const char *s, const char *e)
+	{
+		return *s == '{';
+	}
+};
+
+template<is_maplike T>
+struct parser<T>
+{
+	using K = typename T::key_type;
+	static void parse(T& obj, parse_state& s)
+	{
+		s.obj_begin();
+		while(!s.maybe('}')) {
+			K k;
+			parser<K>::parse(k, s);
+			s.expect(':');
+			parser<typename T::mapped_type>::parse(obj[std::move(k)], s);
+			s.table_next();
+		}
+	}
+	static bool precheck_parse(const char *s, const char *e)
+	{
+		return *s == '{';
+	}
+};
+
+template<typename... V>
+struct parser<std::variant<V...>>
+{
+	using type = std::variant<V...>;
+
+	static void parse(type& obj, parse_state& s)
+	{
+		parse_helper(obj, s, std::make_index_sequence<sizeof...(V)>());
+	}
+	template<size_t... Index>
+	static void parse_helper(type& obj, parse_state& s, std::index_sequence<Index...>)
+	{
+		if(!(maybe_parse<Index>(obj, s) || ...)) {
+			if(!s.opts.allow_unknown_variant_values) [[unlikely]]
+				throw status::bad_variant_value;
+			s.skip_element();
+		}
+	}
+	template<size_t I>
+	static bool maybe_parse(type& obj, parse_state& s)
+	{
+		if(!parser<std::variant_alternative_t<I, type>>::precheck_parse(s.s, s.e))
+			return false;
+		const char *at = s.s;
+		try {
+			std::variant_alternative_t<I, type> v{};
+			parser<std::variant_alternative_t<I, type>>::parse(v, s);
+			obj = v;
+			return true;
+		} catch(status) {
+			s.s = at;
+			return false;
+		}
+	}
+};
+
+
+template<is_aggregate_struct T>
+struct parser<T>
+{
+	static void parse(T& obj, parse_state& s)
+	{
+		if(s.depth++ > s.opts.max_depth) [[unlikely]] {
+			throw status::stack_overflow;
+		}
+		bool skip = s.opts.skip_initial_scope;
+		s.opts.skip_initial_scope = false;
+		if(!skip) [[likely]] {
+			s.obj_begin();
+			if(s.maybe('}'))
+				return;
+		}
+		// JSON is limited to only string keys
+		while(!s.maybe('}')) {
+			auto k = s.parse_name_string();
+			s.expect(':');
+			uint32_t index = get_member_index<T>(k);
+			if(index > typeinfo<T>::Arity) [[unlikely]] {
+				if(!s.opts.allow_unknown_keys) [[unlikely]] {
+					throw status::unknown_key;
+				}
+				// Need to skip
+				s.skip_element();
+			} else {
+				nameparser p{s, index};
+				foreach_member(obj, p);
+			}
+			if(!s.table_next()) {
+				if(!skip) [[likely]]
+					s.obj_end();
+				break;
+			}
+		}
+		s.depth--;
+	}
+
+	// This checks if it's worth maybe trying to parse this
+	static bool precheck_parse(const char *s, const char *e)
+	{
+		return *s == '{';
+	}
+};
+
+inline const char *pp_shortstr(std::string& s, const char *p, const char *e)
+{
+	char ch = *p++;
+	s.push_back(ch);
+	while(p < e) {
+		if(*p == ch) {
+			break;
+		}
+		s.push_back(*p++);
+	}
+	s.push_back(ch);
+	return p + 1;
+}
+
+inline const char *prettyprint(std::string& s, const char *p, const char *e, int scope = 0)
+{
+	int original_scope = scope;
+	int state = 1; // 0 = after newline, 1 = after data, 2 = after assign,
+	while(p < e) {
+		if(*p == '{' || *p == '[') {
+			scope++;
+			s.push_back(*p);
+			if(original_scope == 0 || scope != original_scope + 1) {
+				s.push_back('\n');
+				s.append(scope, '\t');
+			}
+			state = 0;
+		} else if(*p == '}' || *p == ']') {
+			if(state == 1) {
+				s.push_back('\n');
+				s.append(scope, '\t');
+			}
+			if(s.back() == '\t')
+				s.pop_back();
+			scope--;
+			s.push_back(*p);
+		} else if(*p == ',') {
+			s.push_back(',');
+			s.push_back('\n');
+			s.append(scope, '\t');
+			state = 0;
+		} else if(*p == '"') {
+			// short string
+			state = 1;
+			p = pp_shortstr(s, p, e);
+			continue;
+		} else if(*p == ':') {
+			state = 2;
+			s.append(": ");
+			p++;
+			continue;
+		} else if(*p > ' ') {
+			// non-whitespace
+			state = 1;
+			s.push_back(*p);
+		}
+		p++;
+	}
+	return p;
+}
+
+struct writer_state
+{
+	format_options opts;
+	std::string o;
+
+	void newscope()
+	{
+		o.push_back('{');
+	}
+	void endscope()
+	{
+		o.push_back('}');
+	}
+	void newarr()
+	{
+		o.push_back('[');
+	}
+	void endarr()
+	{
+		o.push_back(']');
+	}
+	void next()
+	{
+		o.push_back(',');
+	}
+	void prefix() {}
+
+	void writestr(std::string_view s)
+	{
+		size_t at = o.size();
+		o.reserve(at + s.size() + 8);
+		o.append(" \"");
+		int n = 0;
+		int level = -1;
+		const char *raw = s.data();
+		for(size_t i = 0; i < s.size(); i++) {
+			o.push_back(raw[i]);
+		}
+		o.push_back('"');
+	}
+};
+
+template<typename T>
+constexpr bool is_default_value(const T&)
+{
+	return false;
+}
+
+template<std::equality_comparable T>
+constexpr bool is_default_value(const T& o)
+{
+	return o == T{};
+}
+
+template<typename T>
+struct writer;
+
+template<is_aggregate_struct T>
+struct writer<T>
+{
+	writer_state& s;
+	uint32_t n = 0;
+
+	static void write(const T& obj, writer_state& s)
+	{
+		size_t at = s.o.size();
+		bool skip = s.opts.skip_initial_scope;
+		s.opts.skip_initial_scope = false;
+		if(!skip) [[likely]]
+			s.newscope();
+		writer<T> wr{s};
+		foreach_member(const_cast<T&>(obj), wr);
+		if(!skip) [[likely]]
+			s.endscope();
+		if(wr.n == 0 && s.opts.omit_default)
+			s.o.resize(at);
+	}
+
+	constexpr void enter(std::string_view name) {}
+	constexpr void leave() {}
+
+	template<typename U>
+	void visit(uint32_t index, std::string_view name, U& obj)
+	{
+		if(s.opts.omit_default && is_default_value(obj))
+			return;
+		n++;
+		// Generally a C++ name can also be a valid Lua name with the only difference being keywords
+		// and break do else false for goto if not or return true while are C++ keywords too
+		// elseif end function in local nil repeat then until are not
+		s.prefix();
+		if(!s.opts.omit_names) {
+			s.o.push_back('"');
+			s.o.append(name);
+			s.o.push_back('"');
+			s.o.push_back(':');
+		}
+		writer<U>::write(obj, s);
+		s.next();
+	}
+};
+
+template<is_maplike T>
+struct writer<T>
+{
+	static void write(const T& obj, writer_state& s)
+	{
+		s.newscope();
+		for(const auto& [k, v] : obj) {
+			s.prefix();
+			writer<typename T::key_type>::write(k, s);
+			s.o.push_back(':');
+			writer<typename T::mapped_type>::write(v, s);
+			s.next();
+		}
+		s.endscope();
+	}
+};
+
+// T[N] & array<T, N>
+template<typename T>
+    requires(std::is_aggregate_v<T> && is_array_type<T>::value)
+struct writer<T>
+{
+	using type = typename is_array_type<T>::type;
+	static constexpr uint32_t N = is_array_type<T>::kN;
+
+	static void write(const T *obj, writer_state& s)
+	{
+		s.newarr();
+		for(uint32_t i = 0; i < N; i++) {
+			s.prefix();
+			writer<T>::write(obj[i], s);
+			s.next();
+		}
+		s.endarr();
+	}
+	static void write(const std::array<type, N>& obj, writer_state& s)
+	{
+		s.newarr();
+		for(uint32_t i = 0; i < N; i++) {
+			s.prefix();
+			writer<type>::write(obj[i], s);
+			s.next();
+		}
+		s.endarr();
+	}
+};
+
+template<is_container T>
+struct writer<T>
+{
+	using type = T;
+	static void write(const type& obj, writer_state& s)
+	{
+		s.newarr();
+		for(auto& v : obj) {
+			s.prefix();
+			writer<typename T::value_type>::write(v, s);
+			s.next();
+		}
+		s.endarr();
+	}
+};
+
+template<std::integral T>
+struct writer<T>
+{
+	static void write(T obj, writer_state& s)
+	{
+		char temp[32];
+		auto r = std::to_chars(temp, temp + sizeof(temp), obj);
+		s.o.append(temp, r.ptr);
+	}
+};
+
+template<std::floating_point T>
+struct writer<T>
+{
+	static void write(T obj, writer_state& s)
+	{
+		char temp[32];
+		auto r = std::to_chars(temp, temp + sizeof(temp), obj);
+		s.o.append(temp, r.ptr);
+	}
+};
+
+template<>
+struct writer<bool>
+{
+	static void write(bool obj, writer_state& s)
+	{
+		s.o.append(obj ? "true" : "false");
+	}
+};
+
+template<is_stringlike T>
+struct writer<T>
+{
+	using type = T;
+	static void write(const type& obj, writer_state& s)
+	{
+		s.writestr(obj);
+	}
+};
+
+template<typename T, typename U>
+struct writer<std::pair<T, U>>
+{
+	using type = std::pair<T, U>;
+	static void write(const type& obj, writer_state& s)
+	{
+		s.o.push_back('[');
+		writer<T>::write(obj.first, s);
+		s.o.push_back(',');
+		writer<U>::write(obj.second, s);
+		s.o.push_back(']');
+	}
+};
+
+template<typename... V>
+struct writer<std::variant<V...>>
+{
+	using type = std::variant<V...>;
+
+	static void write(const type& obj, writer_state& s)
+	{
+		write_helper(obj, s, std::make_index_sequence<sizeof...(V)>());
+	}
+
+	template<size_t... Index>
+	static void write_helper(const type& obj, writer_state& s, std::index_sequence<Index...>)
+	{
+		size_t index = obj.index();
+		(maybe_write<Index>(obj, s, index) || ...);
+	}
+	template<size_t I>
+	static bool maybe_write(const type& obj, writer_state& s, size_t index)
+	{
+		if(I == index) {
+			writer<std::variant_alternative_t<I, type>>::write(std::get<I>(obj), s);
+			return true;
+		}
+		return false;
+	}
+};
+
+template<typename... V>
+struct writer<std::tuple<V...>>
+{
+	using type = std::tuple<V...>;
+
+	static bool write(const type& obj, writer_state& s)
+	{
+		size_t at = s.o.size();
+		s.newarr();
+		if(write_helper(obj, s, std::make_index_sequence<sizeof...(V)>()) || !s.opts.omit_default) {
+			s.endarr();
+			return true;
+		}
+		s.o.resize(at);
+		return false;
+	}
+
+	template<size_t... Index>
+	static size_t write_helper(const type& obj, writer_state& s, std::index_sequence<Index...>)
+	{
+		return (write_one<Index>(obj, s) + ...);
+	}
+
+	template<size_t I>
+	static size_t write_one(const type& obj, writer_state& s)
+	{
+		if(s.opts.omit_default && is_default_value(std::get<I>(obj)))
+			return 0;
+		writer<std::tuple_element_t<I, type>>::write(std::get<I>(obj), s);
+		s.next();
+		return 1;
+	}
+};
+
+
+} // namespace detail
+
+template<typename T>
+inline status parse(T& obj, std::string_view text, const parse_options& opts = parse_options())
+{
+	detail::parse_state s{opts, text.data(), text.data() + text.size()};
+	try {
+		s.skip_ws();
+		detail::parser<T>::parse(obj, s);
+		return s.finish();
+	} catch(status s) {
+		return s;
+	}
+}
+
+template<typename T>
+inline void format(const T& obj, std::string& text, const format_options& opts = format_options())
+{
+	detail::writer_state s{opts};
+	detail::writer<T>::write(obj, s);
+	text.swap(s.o);
+}
+
+inline std::string prettyprint(std::string_view in)
+{
+	std::string s;
+	s.reserve((in.size() * 3) / 2);
+	detail::prettyprint(s, in.data(), in.data() + in.size());
+	return s;
+}
+} // namespace packall::json
 
 #endif

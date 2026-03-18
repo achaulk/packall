@@ -79,9 +79,6 @@ struct Config
 	std::array<double, 9> K_matrix;
 	std::vector<double> distortion_coeffients;
 	std::map<std::string, std::variant<uint16_t, std::string, bool>> parameters;
-
-	static constexpr const char *kMembers[] = {
-	    "device", "resolution", "K_matrix", "distortion_coeffients", "parameters"};
 };
 
 struct everything

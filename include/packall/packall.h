@@ -176,6 +176,17 @@ struct bytebuffer
 		return *p;
 	}
 
+	void *span_bytes(size_t sz)
+	{
+		if(e - p < (ptrdiff_t)sz) [[unlikely]] {
+			throw status::read_disjoint_into_span;
+		}
+		auto ret = p;
+		p += sz;
+		if(p == e) [[unlikely]]
+			more_data(0);
+		return ret;
+	}
 	void read_bytes(void *v, size_t sz)
 	{
 		if(e - p < (ptrdiff_t)sz) [[unlikely]] {
@@ -215,29 +226,27 @@ namespace detail {
 template<typename T>
 struct typeinfo;
 
-struct any
+struct any final
 {
 	template<typename type>
-	operator type();
+	constexpr operator type() const;
 };
 
 template<class T, class... Args>
+    requires(std::is_aggregate_v<std::remove_cvref_t<T>>)
+inline constexpr auto count_members = [] {
+	using V = std::remove_cvref_t<T>;
+	if constexpr(requires { V{Args{}..., any{}}; }) {
+		return count_members<V, Args..., any>;
+	} else {
+		return sizeof...(Args);
+	}
+}();
+
+template<class T>
 struct aggregate_arity
 {
-	// Approximate the number of initializers required, add one until there are too many.
-	// This miscomputes for C arrays (one initializer per element) and optional (stops the sequence)
-	static constexpr size_t count(void *)
-	{
-		return sizeof...(Args) - 1;
-	}
-
-	template<typename U = T, typename = decltype(U{Args{}...})>
-	static constexpr size_t count(std::nullptr_t)
-	{
-		return aggregate_arity<T, Args..., any>::value;
-	}
-
-	static constexpr size_t value = count(nullptr);
+	static constexpr size_t value = count_members<T>;
 };
 
 template<size_t>
@@ -498,6 +507,13 @@ struct bytes_converter
 		wrap.read_bytes(&v, sizeof(v));
 	}
 
+	template<typename U>
+	void spanbuf(U& buf, size_t sz)
+	{
+		using Ty = typename U::value_type;
+		void *ptr = wrap.span_bytes(sz);
+		buf = U{(Ty *)ptr, sz / sizeof(Ty)};
+	}
 	void readbuf(void *buf, size_t sz)
 	{
 		wrap.read_bytes(buf, sz);
@@ -556,15 +572,72 @@ template<typename T>
 concept has_member_names = requires() { T::kMembers; };
 
 template<has_member_names T, size_t Index>
-constexpr const char *get_member_name()
+constexpr std::string_view get_member_name()
 {
 	return T::kMembers[Index];
 }
 
-template<typename T, size_t Index>
-constexpr const char *get_member_name()
+template<auto T>
+consteval auto func_name()
 {
-	return nullptr;
+#ifdef _MSC_VER
+	// class std::basic_string_view<char,struct std::char_traits<char> > __cdecl func_name<&external<struct a_struct>->a_var>(void
+	std::string_view str = std::source_location::current().function_name();
+	auto s = str.rfind("->");
+	auto e = str.rfind('>');
+	return str.substr(s + 2, e - (s + 2));
+#elif defined(__clang__)
+	// std::string_view func_name() [T = &external.a_var]
+	std::string_view str = std::source_location::current().function_name();
+	auto s = str.rfind(".");
+	auto e = str.rfind(']');
+	return str.substr(s + 1, e - (s + 1));
+#else
+	// consteval std::string_view func_name() [with auto T = (& external<a_struct>.a_struct::a_var); std::string_view = std::basic_string_view<char>]
+	std::string_view str = std::source_location::current().function_name();
+	auto f = str.rfind("external");
+	auto s = str.find("::", f);
+	auto e = str.find(')', s);
+	return str.substr(s + 2, e - (s + 2));
+#endif
+}
+
+template<size_t N, class T>
+constexpr auto get_member_ptr(T&& t) noexcept
+{
+	auto& p = decompose<aggregate_arity_calc<T>::Arity>::get<N>(t);
+	return &p;
+}
+
+// I hate this but it works
+template<typename T>
+extern const T external;
+
+template<size_t N, typename T>
+struct compact_member_name
+{
+#ifdef __clang__
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wundefined-var-template"
+#endif
+	static constexpr size_t S = func_name<get_member_ptr<N>(external<T>)>().size() + 1;
+	static inline constinit std::array<char, S> name = []() {
+		std::array<char, S> arr{};
+		auto s = func_name<get_member_ptr<N>(external<T>)>();
+		for(size_t i = 0; i < s.size(); i++) arr[i] = s[i];
+		arr[S - 1] = '\0';
+		return arr;
+	}();
+#ifdef __clang__
+#pragma clang diagnostic pop
+#endif
+};
+
+template<typename T, size_t Index>
+consteval std::string_view get_member_name()
+{
+	constexpr auto& e = compact_member_name<Index, T>::name;
+	return std::string_view(e.begin(), e.end() - 1);
 }
 
 template<typename T>
@@ -683,9 +756,9 @@ enum class type_id : uint8_t
 // custom
 template<typename T>
 concept is_custom_serialized = requires(T t) {
-	                               t.pack;
-	                               t.unpack;
-                               };
+	t.pack;
+	t.unpack;
+};
 
 template<is_custom_serialized T>
 struct typeinfo<T>
@@ -722,9 +795,9 @@ struct has_predecode_info : public std::false_type
 
 template<typename T>
 concept has_predecode_bool = requires(T t) {
-	                             typeinfo<T>::predecode_info;
-	                             typeinfo<T>::use_predecode;
-                             };
+	typeinfo<T>::predecode_info;
+	typeinfo<T>::use_predecode;
+};
 
 template<has_predecode_bool T>
 struct has_predecode_info<T>
@@ -735,12 +808,17 @@ struct has_predecode_info<T>
 // Pick apart various containers
 
 template<typename T>
-concept is_container = !
-is_array_type<T>::value&& requires(T t) {
-	                          t.begin();
-	                          t.end();
-	                          t.size();
-                          };
+concept is_container = !is_array_type<T>::value && requires(T t) {
+	t.begin();
+	t.end();
+	t.size();
+};
+
+template<typename T>
+concept is_stringlike = is_container<T> && requires(T t)
+{
+	{ t.data() } -> std::convertible_to<const char*>;
+};
 
 template<typename T>
 concept is_setlike = is_container<T> && requires { typename T::key_type; };
@@ -750,13 +828,19 @@ concept is_maplike = is_setlike<T> && requires { typename T::mapped_type; };
 
 template<typename T>
 concept is_listlike = is_container<T> && requires(T t, size_t sz) {
-	                                         typename T::value_type;
-	                                         t.resize(sz);
-                                         };
+	typename T::value_type;
+	t.resize(sz);
+};
+template<typename T>
+concept is_spanlike = !is_listlike<T> && is_container<T> && requires(T t, size_t sz) {
+	typename T::value_type;
+	t.data();
+	T(t.begin(), t.end());
+};
 
 template<typename T>
-concept is_aggregate_struct = std::is_aggregate_v<T> && !
-is_array_type<T>::value && !is_custom_serialized<T> && std::is_class_v<T>;
+concept is_aggregate_struct =
+    std::is_aggregate_v<T> && !is_array_type<T>::value && !is_custom_serialized<T> && std::is_class_v<T>;
 
 template<typename T>
 struct emit_element
@@ -774,7 +858,7 @@ static consteval uint8_t calculate_predecode(std::index_sequence<Index...>)
 {
 	return (
 	    emit_element<std::remove_cvref_t<decltype(decompose<Arity>::template get<Index>(std::declval<T>()))>>::value +
-	    ...);
+	    ... + 0);
 }
 
 template<typename T>
@@ -1388,18 +1472,29 @@ struct typeinfo<std::basic_string<T, Traits, Alloc>>
 	}
 };
 
-template<typename T, typename Traits>
-struct typeinfo<std::basic_string_view<T, Traits>>
+template<is_spanlike T>
+struct typeinfo<T>
 {
-	using type = std::basic_string_view<T>;
+	using type = T;
 	static constexpr uint8_t type_id = static_cast<uint8_t>(type_id::string);
-	static_assert(std::is_fundamental_v<T>);
+	static_assert(std::is_trivial_v<typename T::value_type>);
 
 	template<typename Container>
 	static void pack(const type& obj, Container& out)
 	{
 		out.write_sz(obj.size() + 1);
-		out.writebuf(obj.data(), obj.size() * sizeof(T));
+		out.writebuf(obj.data(), obj.size() * sizeof(typename T::value_type));
+	}
+	template<typename Container>
+	static void unpack(type& v, Container& in)
+	{
+		size_t sz = in.read_sz();
+		if(sz == 0)
+			return;
+		sz--;
+		if(sz > kMaximumVectorSize) [[unlikely]]
+			throw status::out_of_memory;
+		in.spanbuf(v, sz * sizeof(typename T::value_type));
 	}
 
 	static constexpr void get_types(type_list& t)
@@ -1586,11 +1681,10 @@ struct typeinfo<std::unique_ptr<T, D>>
 };
 
 template<typename T>
-concept is_custom_polymorphic =
-    std::is_abstract_v<T> && is_custom_serialized<T> && requires(T t) {
-	                                                        t.pack_type_id();
-	                                                        T::pack_create_as(t.pack_type_id());
-                                                        };
+concept is_custom_polymorphic = std::is_abstract_v<T> && is_custom_serialized<T> && requires(T t) {
+	t.pack_type_id();
+	T::pack_create_as(t.pack_type_id());
+};
 
 template<is_custom_polymorphic T, typename D>
 struct typeinfo<std::unique_ptr<T, D>>
@@ -1976,10 +2070,10 @@ static constexpr uint8_t kFirstUserType = static_cast<uint8_t>(detail::type_id::
 
 template<typename T>
 concept is_vectorlike_container = requires(T t, uint8_t v) {
-	                                  t.push_back(v);
-	                                  t.data();
-	                                  t.size();
-                                  };
+	t.push_back(v);
+	t.data();
+	t.size();
+};
 
 template<is_vectorlike_container T>
 struct bytebuffer_impl<T> : public bytebuffer
